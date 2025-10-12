@@ -1,6 +1,7 @@
 """Minimal smoke test for the Miami2025 evaluator pipeline."""
 
 import argparse
+import importlib.machinery
 import importlib.util
 import itertools
 import json
@@ -18,11 +19,128 @@ if REPO_ROOT not in sys.path:
 import numpy as np
 import torch
 import torch.nn.functional as F
+import types
 
 try:  # pragma: no cover - optional dependency
     import cv2  # type: ignore
 except ImportError:  # pragma: no cover
     cv2 = None
+
+def _install_mapper_import_stubs() -> None:
+    """Install lightweight stub modules so RefCOCOMapper can be imported offline."""
+
+    if "detectron2.config" not in sys.modules:
+        detectron2_root = types.ModuleType("detectron2")
+        detectron2_root.__spec__ = importlib.machinery.ModuleSpec("detectron2", loader=None)
+
+        config_mod = types.ModuleType("detectron2.config")
+        config_mod.__spec__ = importlib.machinery.ModuleSpec("detectron2.config", loader=None)
+
+        def configurable(func=None, **_kwargs):
+            if func is None:
+                def decorator(f):
+                    return f
+
+                return decorator
+            return func
+
+        config_mod.configurable = configurable
+
+        data_mod = types.ModuleType("detectron2.data")
+        data_mod.__spec__ = importlib.machinery.ModuleSpec("detectron2.data", loader=None)
+        detection_utils_mod = types.ModuleType("detectron2.data.detection_utils")
+        detection_utils_mod.__spec__ = importlib.machinery.ModuleSpec(
+            "detectron2.data.detection_utils", loader=None
+        )
+        transforms_mod = types.ModuleType("detectron2.data.transforms")
+        transforms_mod.__spec__ = importlib.machinery.ModuleSpec(
+            "detectron2.data.transforms", loader=None
+        )
+
+        def _read_image_stub(path, format=None):
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+        detection_utils_mod.read_image = _read_image_stub
+        detection_utils_mod.check_image_size = lambda dataset_dict, image: None
+        detection_utils_mod.transform_instance_annotations = (
+            lambda obj, transforms, image_shape: obj
+        )
+
+        class _DummyGTMasks:
+            def __init__(self, annos):
+                self.polygons = [ann.get("segmentation", []) for ann in annos]
+
+            def get_bounding_boxes(self):
+                return None
+
+        class _DummyInstances:
+            def __init__(self, annos, image_shape):
+                self._annos = list(annos)
+                self.image_size = image_shape
+                self.gt_masks = _DummyGTMasks(self._annos)
+                self.gt_boxes = None
+
+            def __len__(self):
+                return len(self._annos)
+
+        detection_utils_mod.annotations_to_instances = (
+            lambda annos, image_shape: _DummyInstances(annos, image_shape)
+        )
+
+        transforms_mod.Resize = lambda size: None
+        transforms_mod.apply_transform_gens = lambda gens, image: (
+            image,
+            SimpleNamespace(apply_segmentation=lambda seg: seg),
+        )
+
+        structures_mod = types.ModuleType("detectron2.structures")
+        structures_mod.__spec__ = importlib.machinery.ModuleSpec(
+            "detectron2.structures", loader=None
+        )
+
+        class _BoxMode:
+            XYXY_ABS = 0
+
+            @staticmethod
+            def convert(bbox, from_mode, to_mode):
+                return bbox
+
+        structures_mod.BoxMode = _BoxMode
+
+        class _MetadataCatalog:
+            _store: Dict[str, SimpleNamespace] = {}
+
+            @classmethod
+            def get(cls, name: str) -> SimpleNamespace:
+                return cls._store.setdefault(name, SimpleNamespace())
+
+        data_mod.detection_utils = detection_utils_mod
+        data_mod.transforms = transforms_mod
+        data_mod.MetadataCatalog = _MetadataCatalog
+
+        sys.modules["detectron2"] = detectron2_root
+        sys.modules["detectron2.config"] = config_mod
+        sys.modules["detectron2.data"] = data_mod
+        sys.modules["detectron2.data.detection_utils"] = detection_utils_mod
+        sys.modules["detectron2.data.transforms"] = transforms_mod
+        sys.modules["detectron2.structures"] = structures_mod
+
+    if "transformers" not in sys.modules:
+        transformers_mod = types.ModuleType("transformers")
+        transformers_mod.__spec__ = importlib.machinery.ModuleSpec("transformers", loader=None)
+
+        class _StubTokenizer:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                class _Tokenizer:
+                    def encode(self, text, add_special_tokens=True):
+                        return [101, 102]
+
+                return _Tokenizer()
+
+        transformers_mod.BertTokenizer = _StubTokenizer
+        sys.modules["transformers"] = transformers_mod
+
 
 try:
     from gres_model.utils.mask_ops import (
@@ -43,7 +161,26 @@ except ModuleNotFoundError:
     _rle_to_mask_safe = mask_ops._rle_to_mask_safe
     bbox_to_mask = mask_ops.bbox_to_mask
     merge_instance_masks = mask_ops.merge_instance_masks
-    RefCOCOMapper = None  # type: ignore[assignment]
+
+    try:
+        _install_mapper_import_stubs()
+        mapper_spec = importlib.util.spec_from_file_location(
+            "refcoco_mapper_stub",
+            os.path.join(
+                REPO_ROOT, "gres_model", "data", "dataset_mappers", "refcoco_mapper.py"
+            ),
+        )
+        if mapper_spec is not None and mapper_spec.loader is not None:
+            mapper_module = importlib.util.module_from_spec(mapper_spec)
+            mapper_spec.loader.exec_module(mapper_module)  # type: ignore[attr-defined]
+            RefCOCOMapper = mapper_module.RefCOCOMapper  # type: ignore[attr-defined]
+        else:
+            RefCOCOMapper = None  # type: ignore[assignment]
+    except Exception as mapper_exc:  # pragma: no cover - diagnostic aid
+        print(
+            f"[smoke_eval] WARNING: failed to import RefCOCOMapper with stubs: {mapper_exc}"
+        )
+        RefCOCOMapper = None  # type: ignore[assignment]
 
 
 _MAPPER_CACHE: Optional["RefCOCOMapper"] = None
@@ -250,12 +387,36 @@ def _decode_annotation_offline(
     return merge_instance_masks(masks, height, width, statuses=statuses)
 
 
+def _maybe_decode_with_mapper(
+    mapper: Optional["RefCOCOMapper"],
+    ann: Dict,
+    height: int,
+    width: int,
+    original_hw: Optional[Tuple[int, int]],
+):
+    if mapper is None:
+        return None, None
+
+    decode_fn = getattr(mapper, "_decode_annotation_mask", None)
+    if decode_fn is None:
+        return None, None
+
+    try:
+        return decode_fn(ann, height, width, original_hw=original_hw)
+    except TypeError as exc:
+        raise RuntimeError(
+            "RefCOCOMapper._decode_annotation_mask signature mismatch; "
+            "expected (ann, height, width, original_hw=...)."
+        ) from exc
+
+
 def _merge_group_offline(
     group_anns: Sequence[Dict],
     height: int,
     width: int,
     *,
     img_hw_map: Dict[int, Tuple[int, int]],
+    mapper: Optional["RefCOCOMapper"],
 ) -> Tuple[np.ndarray, str]:
     group_masks: List[np.ndarray] = []
     statuses: List[str] = []
@@ -270,12 +431,14 @@ def _merge_group_offline(
             except (TypeError, ValueError):
                 original_hw = None
 
-        mask, status = _decode_annotation_offline(
-            ann,
-            height,
-            width,
-            original_size=original_hw,
-        )
+        mask, status = _maybe_decode_with_mapper(mapper, ann, height, width, original_hw)
+        if mask is None:
+            mask, status = _decode_annotation_offline(
+                ann,
+                height,
+                width,
+                original_size=original_hw,
+            )
         if mask is not None and mask.sum() > 0:
             group_masks.append(mask)
             statuses.append(status)
@@ -387,6 +550,10 @@ def _run_offline(args: argparse.Namespace) -> None:
     synthetic_failures: List[int] = []
     missing_accumulator: Dict[int, List[int]] = {}
 
+    decode_mapper: Optional["RefCOCOMapper"] = (
+        mapper if hasattr(mapper, "_decode_annotation_mask") else None
+    )
+
     for sample in dataset:
         if args.split and sample.get("split") != args.split:
             continue
@@ -425,6 +592,7 @@ def _run_offline(args: argparse.Namespace) -> None:
                 height,
                 width,
                 img_hw_map=img_map,
+                mapper=decode_mapper,
             )
             final_mask = np.maximum(final_mask, group_mask)
             readable_tokens.append(mode_label)

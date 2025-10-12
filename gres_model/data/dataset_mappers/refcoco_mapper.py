@@ -377,16 +377,25 @@ class RefCOCOMapper:
         return None
 
     def _synthesize_mask(self, dataset_dict):
-        fallback_shape = None
-        image = dataset_dict.get("image")
-        if torch.is_tensor(image):
-            fallback_shape = (int(image.shape[-2]), int(image.shape[-1]))
-        elif isinstance(image, np.ndarray):
-            fallback_shape = image.shape[:2]
+        image_hw = None
+        image_value = dataset_dict.get("image")
+        if torch.is_tensor(image_value):
+            image_hw = (int(image_value.shape[-2]), int(image_value.shape[-1]))
+        elif isinstance(image_value, np.ndarray):
+            image_hw = tuple(int(v) for v in image_value.shape[:2])
+
+        dataset_height = dataset_dict.get("height")
+        dataset_width = dataset_dict.get("width")
+        fallback_shape = image_hw
+        if fallback_shape is None and dataset_height is not None and dataset_width is not None:
+            try:
+                fallback_shape = (int(dataset_height), int(dataset_width))
+            except (TypeError, ValueError):
+                fallback_shape = None
 
         height, width = self._normalize_hw(
-            dataset_dict.get("height"),
-            dataset_dict.get("width"),
+            image_hw[0] if image_hw else dataset_height,
+            image_hw[1] if image_hw else dataset_width,
             fallback_shape,
         )
 
@@ -568,6 +577,10 @@ class RefCOCOMapper:
             fallback_used = True
             _accumulate_status("synthetic_fallback", "synthetic", final_mask)
 
+        if final_mask.shape != (height, width):
+            resized_mask = self._resize_mask(final_mask, height, width)
+            if resized_mask is not None:
+                final_mask = resized_mask
         final_mask = np.ascontiguousarray((final_mask > 0).astype(np.uint8, copy=False))
         dataset_dict["height"], dataset_dict["width"] = height, width
 
