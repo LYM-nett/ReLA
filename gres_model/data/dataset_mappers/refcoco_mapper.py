@@ -187,29 +187,37 @@ class RefCOCOMapper:
     def _merge_masks(x):
         return x.sum(dim=0, keepdim=True).clamp(max=1)
 
+    _SAFE_DEFAULT_HW = (480, 640)
+
     @staticmethod
-    def _normalize_hw(height, width, fallback_shape):
-        def _safe_int(value, default=0):
+    def _normalize_hw(height, width, fallback_shape=None):
+        """Resolve a valid ``(height, width)`` tuple with sane fallbacks."""
+
+        def _safe_pair(candidate):
+            if candidate is None:
+                return None
+            if isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
+                cand_h, cand_w = candidate[0], candidate[1]
+            else:
+                cand_h, cand_w = candidate, None
             try:
-                value_i = int(value)
+                cand_h_i = int(cand_h)
+                cand_w_i = int(cand_w if cand_w is not None else cand_h)
             except (TypeError, ValueError):
-                value_i = default
-            return value_i if value_i > 0 else default
+                return None
+            if cand_h_i <= 0 or cand_w_i <= 0:
+                return None
+            return cand_h_i, cand_w_i
 
-        h = _safe_int(height)
-        w = _safe_int(width)
+        direct = _safe_pair((height, width))
+        if direct is not None:
+            return direct
 
-        fallback_h = 0
-        fallback_w = 0
-        if fallback_shape is not None:
-            if len(fallback_shape) >= 1:
-                fallback_h = _safe_int(fallback_shape[0])
-            if len(fallback_shape) >= 2:
-                fallback_w = _safe_int(fallback_shape[1])
+        fallback = _safe_pair(fallback_shape)
+        if fallback is not None:
+            return fallback
 
-        h = h or fallback_h or 1
-        w = w or fallback_w or 1
-        return h, w
+        return RefCOCOMapper._SAFE_DEFAULT_HW
 
     @staticmethod
     def _decode_annotation_mask(ann, height, width, *, original_hw=None):
@@ -379,59 +387,34 @@ class RefCOCOMapper:
         return None
 
     def _synthesize_mask(self, dataset_dict):
-        transformed_shape = None
         image = dataset_dict.get("image")
+        transformed_hw = None
         if torch.is_tensor(image):
-            transformed_shape = (int(image.shape[-2]), int(image.shape[-1]))
+            transformed_hw = (int(image.shape[-2]), int(image.shape[-1]))
         elif isinstance(image, np.ndarray):
-            h, w = image.shape[:2]
-            transformed_shape = (int(h), int(w))
+            transformed_hw = (int(image.shape[0]), int(image.shape[1]))
 
-        stored_height = dataset_dict.get("height")
-        stored_width = dataset_dict.get("width")
+        stored_hw = None
+        try:
+            stored_h = int(dataset_dict.get("height"))
+            stored_w = int(dataset_dict.get("width"))
+            if stored_h > 0 and stored_w > 0:
+                stored_hw = (stored_h, stored_w)
+        except (TypeError, ValueError):
+            stored_hw = None
 
-        def _valid_hw(candidate):
-            if candidate is None:
-                return None
-            if isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
-                cand_h, cand_w = candidate[0], candidate[1]
-            else:
-                return None
-            try:
-                cand_h = int(cand_h)
-                cand_w = int(cand_w)
-            except (TypeError, ValueError):
-                return None
-            if cand_h <= 0 or cand_w <= 0:
-                return None
-            return cand_h, cand_w
+        original_hw = dataset_dict.get("_original_hw")
+        fallback_shape = transformed_hw or stored_hw or original_hw or self._SAFE_DEFAULT_HW
+        height_hint = (transformed_hw or stored_hw or fallback_shape)[0]
+        width_hint = (transformed_hw or stored_hw or fallback_shape)[1]
+        height, width = self._normalize_hw(height_hint, width_hint, fallback_shape)
 
-        fallback_shape = None
-        for candidate in (
-            transformed_shape,
-            (stored_height, stored_width),
-            dataset_dict.get("_original_hw"),
-        ):
-            valid = _valid_hw(candidate)
-            if valid is not None:
-                fallback_shape = valid
-                break
-
-        if transformed_shape is not None:
-            height_hint, width_hint = transformed_shape
-        else:
-            height_hint, width_hint = stored_height, stored_width
-
-        height, width = self._normalize_hw(
-            height_hint,
-            width_hint,
-            fallback_shape,
-        )
+        dataset_dict["height"], dataset_dict["width"] = height, width
 
         raw_annotations = dataset_dict.get("_raw_annotations") or []
         transformed_annotations = dataset_dict.get("annotations", []) or []
 
-        ann_ids = self._collect_ann_ids(dataset_dict, raw_annotations)
+        ann_ids = [aid for aid in self._collect_ann_ids(dataset_dict, raw_annotations) if aid >= 0]
 
         inst_json = self._resolve_inst_json(dataset_dict)
         if not inst_json and not self._warned_missing_inst_json:
@@ -440,7 +423,6 @@ class RefCOCOMapper:
             )
             self._warned_missing_inst_json = True
         inst_data = self._load_instance_data(inst_json) if inst_json else None
-
         ann_store = inst_data["annotations"] if inst_data else {}
         image_hw_store = inst_data["image_hw"] if inst_data else {}
 
@@ -449,108 +431,125 @@ class RefCOCOMapper:
         per_instance_statuses = []
         missing_ann_ids: List[int] = []
         fallback_used = False
+        decode_counts = {"POLY": 0, "RLE": 0, "BBOX": 0, "SYNTHETIC": 0}
 
-        def _accumulate_status(ann_identifier, status, mask_np):
-            status_log.append(
-                {
-                    "ann_id": ann_identifier,
-                    "status": status,
-                    "mask_sum": int(mask_np.sum()) if mask_np is not None else 0,
-                }
-            )
+        def _status_to_mode(status: str) -> str:
+            status_lower = (status or "").lower()
+            if "poly" in status_lower:
+                return "POLY"
+            if "rle" in status_lower:
+                return "RLE"
+            if "bbox" in status_lower:
+                return "BBOX"
+            if "synthetic" in status_lower:
+                return "SYNTHETIC"
+            return "UNKNOWN"
 
-        if ann_ids:
-            for ann_id in ann_ids:
-                ann_key = int(ann_id)
-                ann_record = self.id_to_ann.get(ann_key) if self.id_to_ann else None
-                if ann_record is None and ann_store:
-                    ann_record = ann_store.get(ann_key)
-                statuses = []
-                mask_np = None
-                mask_sum = 0
+        for ann_id in ann_ids:
+            ann_key = int(ann_id)
+            ann_record = self.id_to_ann.get(ann_key) if self.id_to_ann else None
+            if ann_record is None and ann_store:
+                ann_record = ann_store.get(ann_key)
 
-                original_hw = dataset_dict.get("_original_hw")
-                if ann_record is not None:
-                    image_id = ann_record.get("image_id")
-                    if image_id is not None:
-                        try:
-                            mapped_hw = image_hw_store.get(int(image_id))
-                            if mapped_hw:
-                                original_hw = mapped_hw
-                        except (TypeError, ValueError):
-                            original_hw = None
+            mask_np = None
+            statuses = []
+            original_for_ann = original_hw
 
+            if ann_record is not None:
+                image_id = ann_record.get("image_id")
+                if image_id is not None:
+                    try:
+                        mapped_hw = image_hw_store.get(int(image_id))
+                        if mapped_hw:
+                            original_for_ann = mapped_hw
+                    except (TypeError, ValueError):
+                        original_for_ann = original_hw
+
+                decoded_mask, decode_status = self._decode_annotation_mask(
+                    ann_record,
+                    height,
+                    width,
+                    original_hw=original_for_ann,
+                )
+                if decode_status:
+                    statuses.append(decode_status)
+                if decoded_mask is not None and decoded_mask.sum() > 0:
+                    mask_np = decoded_mask
+
+            if mask_np is None:
+                raw_ann = self._find_raw_annotation(raw_annotations, ann_id)
+                if raw_ann is not None:
                     decoded_mask, decode_status = self._decode_annotation_mask(
-                        ann_record, height, width, original_hw=original_hw
+                        raw_ann,
+                        height,
+                        width,
+                        original_hw=original_hw,
                     )
                     if decode_status:
                         statuses.append(decode_status)
                     if decoded_mask is not None and decoded_mask.sum() > 0:
                         mask_np = decoded_mask
-                        mask_sum = int(decoded_mask.sum())
 
-                if mask_np is None and ann_record is not None:
-                    bbox_mode = ann_record.get("bbox_mode", "XYWH_ABS")
-                    bbox_mask, bbox_status = bbox_to_mask(
-                        ann_record.get("bbox"),
-                        height,
-                        width,
-                        bbox_mode=bbox_mode,
-                    )
-                    if bbox_status:
-                        statuses.append(bbox_status)
-                    if bbox_mask is not None and bbox_mask.sum() > 0:
-                        mask_np = bbox_mask
-                        mask_sum = int(bbox_mask.sum())
-                        fallback_used = True
+            mode_label = None
+            if mask_np is None and ann_record is not None:
+                bbox_mode = ann_record.get("bbox_mode", "XYWH_ABS")
+                bbox_mask, bbox_status = bbox_to_mask(
+                    ann_record.get("bbox"),
+                    height,
+                    width,
+                    bbox_mode=bbox_mode,
+                )
+                if bbox_status:
+                    statuses.append(bbox_status)
+                if bbox_mask is not None and bbox_mask.sum() > 0:
+                    mask_np = bbox_mask
+                    mode_label = "BBOX"
 
-                if ann_record is None:
-                    missing_ann_ids.append(ann_key)
+            if ann_record is None:
+                missing_ann_ids.append(ann_key)
 
-                if mask_np is None:
-                    raw_ann = self._find_raw_annotation(raw_annotations, ann_id)
-                    if raw_ann is not None:
-                        decoded_mask, decode_status = self._decode_annotation_mask(
-                            raw_ann,
-                            height,
-                            width,
-                            original_hw=dataset_dict.get("_original_hw"),
-                        )
-                        if decode_status:
-                            statuses.append(decode_status)
-                        if decoded_mask is not None and decoded_mask.sum() > 0:
-                            mask_np = decoded_mask
-                            mask_sum = int(decoded_mask.sum())
+            if mask_np is None:
+                synthetic_mask = np.zeros((height, width), dtype=np.uint8)
+                synthetic_mask[height // 2, width // 2] = 1
+                mask_np = synthetic_mask
+                statuses.append("synthetic")
+                mode_label = "SYNTHETIC"
 
-                if mask_np is None and transformed_annotations:
-                    for ann in transformed_annotations:
-                        bbox_mask, bbox_status = bbox_to_mask(
-                            ann.get("bbox"),
-                            height,
-                            width,
-                            bbox_mode=ann.get("bbox_mode", BoxMode.XYXY_ABS),
-                        )
-                        if bbox_status:
-                            statuses.append(bbox_status)
-                        if bbox_mask is not None and bbox_mask.sum() > 0:
-                            mask_np = bbox_mask
-                            mask_sum = int(bbox_mask.sum())
-                            fallback_used = True
-                            break
+            mask_np = np.ascontiguousarray((mask_np > 0).astype(np.uint8, copy=False))
+            status_label = "+".join([s for s in statuses if s]) or "missing"
+            per_instance_masks.append(mask_np)
+            per_instance_statuses.append(status_label)
 
-                if mask_np is None:
-                    synthetic_mask = np.zeros((height, width), dtype=np.uint8)
-                    synthetic_mask[height // 2, width // 2] = 1
-                    mask_np = synthetic_mask
-                    mask_sum = 1
-                    statuses.append("synthetic")
-                    fallback_used = True
+            if mode_label is None:
+                mode_label = _status_to_mode(status_label)
+            if mode_label == "UNKNOWN" and "bbox" in status_label.lower():
+                mode_label = "BBOX"
+            if mode_label == "UNKNOWN" and "synthetic" in status_label.lower():
+                mode_label = "SYNTHETIC"
 
-                status_label = "+".join([s for s in statuses if s]) or "missing"
-                mask_np = np.ascontiguousarray((mask_np > 0).astype(np.uint8, copy=False))
-                per_instance_masks.append(mask_np)
-                per_instance_statuses.append(status_label)
-                _accumulate_status(int(ann_id), status_label, mask_np)
+            if mode_label in decode_counts:
+                decode_counts[mode_label] += 1
+            else:
+                decode_counts.setdefault(mode_label, 0)
+
+            if mode_label in ("BBOX", "SYNTHETIC"):
+                fallback_used = True
+
+            status_log.append(
+                {
+                    "ann_id": int(ann_id),
+                    "status": status_label,
+                    "mode": mode_label,
+                    "mask_sum": int(mask_np.sum()),
+                }
+            )
+            logger.debug(
+                "[RefCOCOMapper] ann_id=%s decode=%s mask.shape=%s mask.sum=%d",
+                int(ann_id),
+                mode_label,
+                tuple(mask_np.shape),
+                int(mask_np.sum()),
+            )
 
         if not per_instance_masks and raw_annotations:
             for idx, raw_ann in enumerate(raw_annotations):
@@ -558,15 +557,30 @@ class RefCOCOMapper:
                     raw_ann,
                     height,
                     width,
-                    original_hw=dataset_dict.get("_original_hw"),
+                    original_hw=original_hw,
                 )
                 if decoded_mask is None or decoded_mask.sum() == 0:
                     continue
                 mask_np = np.ascontiguousarray((decoded_mask > 0).astype(np.uint8, copy=False))
+                mode_label = _status_to_mode(decode_status or "poly")
                 per_instance_masks.append(mask_np)
-                status = decode_status or "raw"
-                per_instance_statuses.append(status)
-                _accumulate_status(f"raw_{idx}", status, mask_np)
+                per_instance_statuses.append(decode_status or "raw")
+                decode_counts[mode_label] = decode_counts.get(mode_label, 0) + 1
+                status_log.append(
+                    {
+                        "ann_id": f"raw_{idx}",
+                        "status": decode_status or "raw",
+                        "mode": mode_label,
+                        "mask_sum": int(mask_np.sum()),
+                    }
+                )
+                logger.debug(
+                    "[RefCOCOMapper] ann_id=%s decode=%s mask.shape=%s mask.sum=%d",
+                    f"raw_{idx}",
+                    mode_label,
+                    tuple(mask_np.shape),
+                    int(mask_np.sum()),
+                )
 
         final_mask, merged_status = merge_instance_masks(
             per_instance_masks,
@@ -575,72 +589,47 @@ class RefCOCOMapper:
             statuses=per_instance_statuses if per_instance_statuses else None,
         )
 
-        if (final_mask is None or final_mask.sum() == 0) and transformed_annotations:
-            bbox_masks = []
-            bbox_statuses = []
-            for ann in transformed_annotations:
-                bbox_mask, bbox_status = bbox_to_mask(
-                    ann.get("bbox"),
-                    height,
-                    width,
-                    bbox_mode=ann.get("bbox_mode", BoxMode.XYXY_ABS),
-                )
-                if bbox_mask is not None and bbox_mask.sum() > 0:
-                    bbox_masks.append(bbox_mask)
-                bbox_statuses.append(bbox_status)
-
-            if bbox_masks:
-                final_mask, fallback_status = merge_instance_masks(
-                    bbox_masks,
-                    height,
-                    width,
-                    statuses=bbox_statuses,
-                )
-                fallback_used = True
-                if final_mask is not None:
-                    final_mask = np.ascontiguousarray((final_mask > 0).astype(np.uint8, copy=False))
-                    _accumulate_status("bbox_fallback", fallback_status, final_mask)
-
         if final_mask is None or final_mask.sum() == 0:
             synthetic_mask = np.zeros((height, width), dtype=np.uint8)
             synthetic_mask[height // 2, width // 2] = 1
             final_mask = synthetic_mask
             fallback_used = True
-            _accumulate_status("synthetic_fallback", "synthetic", final_mask)
+            decode_counts["SYNTHETIC"] += 1
+            status_log.append(
+                {
+                    "ann_id": "synthetic_fallback",
+                    "status": "synthetic",
+                    "mode": "SYNTHETIC",
+                    "mask_sum": int(final_mask.sum()),
+                }
+            )
+            logger.debug(
+                "[RefCOCOMapper] ann_id=%s decode=%s mask.shape=%s mask.sum=%d",
+                "synthetic_fallback",
+                "SYNTHETIC",
+                tuple(final_mask.shape),
+                int(final_mask.sum()),
+            )
 
         final_mask = np.ascontiguousarray((final_mask > 0).astype(np.uint8, copy=False))
-        dataset_dict["height"], dataset_dict["width"] = height, width
 
-        decode_counts = {"rle": 0, "poly": 0, "bbox": 0, "synthetic": 0}
-        for entry in status_log:
-            status_tokens = str(entry.get("status", "")).lower().split("+")
-            tokens = {token.strip() for token in status_tokens if token.strip()}
-            if any("rle" in token for token in tokens):
-                decode_counts["rle"] += 1
-            if any("poly" in token for token in tokens):
-                decode_counts["poly"] += 1
-            if any("bbox" in token for token in tokens):
-                decode_counts["bbox"] += 1
-            if any("synthetic" in token for token in tokens):
-                decode_counts["synthetic"] += 1
-
-        if decode_counts["synthetic"] and not (
-            decode_counts["rle"] or decode_counts["poly"] or decode_counts["bbox"]
-        ):
-            mode_label = "SYNTHETIC"
-        elif decode_counts["rle"] + decode_counts["poly"] > 1:
+        if decode_counts.get("POLY", 0) and decode_counts.get("RLE", 0):
             mode_label = "MERGED"
-        elif decode_counts["rle"] + decode_counts["poly"] == 1:
-            mode_label = "MASK"
-        elif decode_counts["bbox"] > 0:
+        elif decode_counts.get("POLY", 0):
+            mode_label = "POLY"
+        elif decode_counts.get("RLE", 0):
+            mode_label = "RLE"
+        elif decode_counts.get("BBOX", 0):
             mode_label = "BBOX"
+        elif decode_counts.get("SYNTHETIC", 0):
+            mode_label = "SYNTHETIC"
         else:
             mode_label = "UNKNOWN"
 
         dataset_dict["mask_status"] = {
             "height": height,
             "width": width,
-            "original_hw": dataset_dict.get("_original_hw"),
+            "original_hw": original_hw,
             "groups": status_log,
             "decode_counts": decode_counts,
             "fallback_used": fallback_used,
@@ -649,7 +638,7 @@ class RefCOCOMapper:
             "inst_json": inst_json,
             "mode": mode_label,
             "missing_ann_ids": missing_ann_ids,
-            "used_synthetic": decode_counts["synthetic"] > 0,
+            "used_synthetic": decode_counts.get("SYNTHETIC", 0) > 0,
         }
 
         image_id = dataset_dict.get("image_id", "unknown")
@@ -674,6 +663,13 @@ class RefCOCOMapper:
             fallback_used,
             source_desc,
         )
+
+        logger.debug(
+            "[RefCOCOMapper] final mask shape=%s mask.sum=%d",
+            tuple(final_mask.shape),
+            int(final_mask.sum()),
+        )
+
         return final_mask
 
     def __call__(self, dataset_dict):
