@@ -1,0 +1,23 @@
+_BASE_: referring_miami2025.yaml
+
+MODEL:
+  META_ARCHITECTURE: "LQMFormer"
+
+DATASETS:
+  TRAIN: ("miami2025_train",)
+  TEST: ("miami2025_val",)
+  TRAIN_MAPPER: "RefCOCOMapper"
+  TEST_MAPPER: "RefCOCOMapper"
+
+INPUT:
+  FORMAT: "RGB"
+
+LQM:
+  DQM:
+    ENABLE: True
+    TOP_P: 0.2
+    NQ: 100
+    LOSS_WEIGHT: 1.0
+    SCORE_DIM: 256
+
+OUTPUT_DIR: "outputs/miami2025_lqm"

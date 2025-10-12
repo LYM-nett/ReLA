@@ -3,6 +3,18 @@
 from detectron2.config import CfgNode as CN
 
 
+def add_lqm_config(cfg):
+    """Add LQM (Language-aware Query Modulation) configs to Detectron2 cfg."""
+
+    cfg.LQM = CN()
+    cfg.LQM.DQM = CN()
+    cfg.LQM.DQM.ENABLE = False
+    cfg.LQM.DQM.TOP_P = 0.2
+    cfg.LQM.DQM.NQ = 100
+    cfg.LQM.DQM.LOSS_WEIGHT = 1.0
+    cfg.LQM.DQM.SCORE_DIM = 256
+
+
 def add_maskformer2_config(cfg):
     """
     Add config for MASK_FORMER.
@@ -60,6 +72,16 @@ def add_maskformer2_config(cfg):
     cfg.MODEL.MASK_FORMER.TEST.OBJECT_MASK_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.OVERLAP_THRESHOLD = 0.0
     cfg.MODEL.MASK_FORMER.TEST.SEM_SEG_POSTPROCESSING_BEFORE_INFERENCE = False
+
+    cfg.MODEL.MASK_FORMER.DQM = CN()
+    cfg.MODEL.MASK_FORMER.DQM.ENABLED = False
+    cfg.MODEL.MASK_FORMER.DQM.NUM_HEADS = 8
+    cfg.MODEL.MASK_FORMER.DQM.HIDDEN_DIM = 256
+    cfg.MODEL.MASK_FORMER.DQM.SCORE_HIDDEN_DIM = 256
+    cfg.MODEL.MASK_FORMER.DQM.SCORE_ACTIVATION = "sigmoid"
+    cfg.MODEL.MASK_FORMER.DQM.APPLY_TO_MASKS = False
+    cfg.MODEL.MASK_FORMER.DQM.APPLY_TO_LOGITS = False
+    cfg.MODEL.MASK_FORMER.DQM.DROPOUT = 0.0
 
     # Sometimes `backbone.size_divisibility` is set to 0 for some backbone (e.g. ResNet)
     # you can use this config to override
@@ -127,3 +149,20 @@ def add_refcoco_config(cfg):
     cfg.REFERRING = CN()
     cfg.REFERRING.BERT_TYPE = "bert-base-uncased"
     cfg.REFERRING.MAX_TOKENS = 20
+
+
+def add_rela_config(cfg):
+    """Register ReLA-specific dataset settings."""
+
+    if not hasattr(cfg, "DATASETS"):
+        cfg.DATASETS = CN()
+
+    cfg.DATASETS.TRAIN_MAPPER = "RefCOCOMapper"
+    cfg.DATASETS.TEST_MAPPER = "RefCOCOMapper"
+
+
+def add_gres_config(cfg):
+    add_maskformer2_config(cfg)
+    add_refcoco_config(cfg)
+    add_lqm_config(cfg)
+    add_rela_config(cfg)
