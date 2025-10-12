@@ -1,19 +1,124 @@
 """Minimal smoke test for the Miami2025 evaluator pipeline."""
 
 import argparse
+import copy
 import importlib.util
 import itertools
+import json
+import os
+import sys
 from collections import Counter
-from typing import Iterable, List
+from types import SimpleNamespace
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-try:
+try:  # pragma: no cover - optional dependency
     import cv2  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:  # pragma: no cover
     cv2 = None
+
+try:
+    from gres_model.utils.mask_ops import (
+        _poly_to_mask_safe,
+        _rle_to_mask_safe,
+        bbox_to_mask,
+        merge_instance_masks,
+    )
+    from gres_model.data.dataset_mappers.refcoco_mapper import RefCOCOMapper
+except ModuleNotFoundError:
+    mask_ops_path = os.path.join(REPO_ROOT, "gres_model", "utils", "mask_ops.py")
+    spec = importlib.util.spec_from_file_location("mask_ops_fallback", mask_ops_path)
+    if spec is None or spec.loader is None:
+        raise
+    mask_ops = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mask_ops)  # type: ignore[attr-defined]
+    _poly_to_mask_safe = mask_ops._poly_to_mask_safe
+    _rle_to_mask_safe = mask_ops._rle_to_mask_safe
+    bbox_to_mask = mask_ops.bbox_to_mask
+    merge_instance_masks = mask_ops.merge_instance_masks
+    RefCOCOMapper = None  # type: ignore[assignment]
+
+
+def _load_instances_namespace(path: str) -> SimpleNamespace:
+    with open(path, "r", encoding="utf-8") as handle:
+        inst_data = json.load(handle)
+    anns = inst_data.get("annotations", []) or []
+    id_to_ann = {
+        int(ann["id"]): ann
+        for ann in anns
+        if isinstance(ann, dict) and "id" in ann
+    }
+    source = path
+    print(
+        f"[smoke_eval] Preloaded {len(id_to_ann)} instance annotations from {source}"
+    )
+    return SimpleNamespace(id_to_ann=id_to_ann, preload_source=source)
+
+
+_MAPPER_CACHE: Optional[SimpleNamespace] = None
+_MAPPER_PRELOAD_ATTEMPTED = False
+
+
+def _attempt_mapper_preload() -> Optional[SimpleNamespace]:
+    global _MAPPER_CACHE, _MAPPER_PRELOAD_ATTEMPTED
+    if _MAPPER_PRELOAD_ATTEMPTED:
+        return _MAPPER_CACHE
+
+    _MAPPER_PRELOAD_ATTEMPTED = True
+
+    if "RefCOCOMapper" in globals() and RefCOCOMapper is not None:
+        try:
+            mapper = RefCOCOMapper(
+                is_train=False,
+                tfm_gens=[],
+                image_format="RGB",
+                bert_type="bert-base-uncased",
+                max_tokens=32,
+                merge=True,
+                preload_only=True,
+            )
+            _MAPPER_CACHE = mapper  # type: ignore[assignment]
+            return _MAPPER_CACHE
+        except Exception as exc:  # pragma: no cover - diagnostic output only
+            print(
+                "[smoke_eval] WARNING: RefCOCOMapper preload failed; falling back to JSON cache: "
+                f"{exc}"
+            )
+
+    default_inst_path = "/autodl-tmp/rela_data/annotations/instances.json"
+    if os.path.exists(default_inst_path):
+        try:
+            _MAPPER_CACHE = _load_instances_namespace(default_inst_path)
+        except (OSError, ValueError, TypeError) as exc:
+            print(
+                "[smoke_eval] WARNING: Failed to preload default instances json "
+                f"{default_inst_path}: {exc}"
+            )
+            _MAPPER_CACHE = None
+    else:
+        print(
+            f"[smoke_eval] WARNING: default instances file not found at {default_inst_path}"
+        )
+        _MAPPER_CACHE = None
+
+    return _MAPPER_CACHE
+
+
+def _ensure_mapper_preloaded() -> Optional[SimpleNamespace]:
+    cache = _attempt_mapper_preload()
+    return cache
+
+
+# Trigger preload attempt at module import for deterministic diagnostics.
+_attempt_mapper_preload()
 
 
 def _as_numpy_mask(mask, height: int, width: int) -> np.ndarray:
@@ -36,11 +141,16 @@ def _as_numpy_mask(mask, height: int, width: int) -> np.ndarray:
         mask_np = mask_np.reshape(mask_np.shape[-2], mask_np.shape[-1])
 
     if mask_np.shape != (height, width):
-        corrected = np.zeros((height, width), dtype=np.uint8)
-        h = min(height, mask_np.shape[0])
-        w = min(width, mask_np.shape[1])
-        corrected[:h, :w] = mask_np[:h, :w]
-        mask_np = corrected
+        print(
+            f"[smoke_eval] WARNING: mask shape {mask_np.shape} does not match target {(height, width)}; "
+            "resizing for diagnostics."
+        )
+        if cv2 is not None:
+            mask_np = cv2.resize(mask_np, (width, height), interpolation=cv2.INTER_NEAREST)
+        else:
+            tensor = torch.from_numpy(mask_np.astype(np.float32, copy=False)).unsqueeze(0).unsqueeze(0)
+            resized = F.interpolate(tensor, size=(height, width), mode="nearest")
+            mask_np = resized.squeeze(0).squeeze(0).to(dtype=torch.uint8).cpu().numpy()
 
     return mask_np
 
@@ -50,10 +160,13 @@ def _build_dummy_outputs(inputs: List[dict]):
     for sample in inputs:
         merged_mask = sample.get("gt_mask_merged")
         image_tensor = sample.get("image")
-        if image_tensor is not None:
+        if image_tensor is not None and torch.is_tensor(image_tensor):
             height, width = image_tensor.shape[1:]
         else:
-            height = width = 1
+            height = int(sample.get("height", 1))
+            width = int(sample.get("width", 1))
+            height = max(height, 1)
+            width = max(width, 1)
 
         mask_np = _as_numpy_mask(merged_mask, height, width)
         mask_tensor = torch.from_numpy(mask_np.astype(np.float32, copy=False)).unsqueeze(0)
@@ -85,20 +198,396 @@ def _resize_to_shape(mask: np.ndarray, height: int, width: int) -> np.ndarray:
     return resized.squeeze(0).squeeze(0).to(dtype=torch.uint8).cpu().numpy()
 
 
-def main():
-    if importlib.util.find_spec("detectron2") is None:
-        print("Detectron2 is not installed. Skipping Miami2025 smoke evaluation.")
+def _decode_annotation_offline(
+    ann: Dict,
+    height: int,
+    width: int,
+    *,
+    original_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[Optional[np.ndarray], str]:
+    seg = ann.get("segmentation")
+    masks: List[np.ndarray] = []
+    statuses: List[str] = []
+
+    if isinstance(seg, dict):
+        mask, status = _rle_to_mask_safe(seg, height, width, original_size=original_size)
+        if mask is not None:
+            masks.append(mask)
+        statuses.append(status)
+    elif isinstance(seg, (list, tuple)):
+        if not seg:
+            statuses.append("seg_missing")
+        elif all(isinstance(poly, (list, tuple)) for poly in seg):
+            mask, status = _poly_to_mask_safe(
+                seg, height, width, original_size=original_size
+            )
+            if mask is not None:
+                masks.append(mask)
+            statuses.append(status)
+        else:
+            for piece in seg:
+                if isinstance(piece, dict):
+                    piece_mask, piece_status = _rle_to_mask_safe(
+                        piece, height, width, original_size=original_size
+                    )
+                elif isinstance(piece, (list, tuple)):
+                    piece_mask, piece_status = _poly_to_mask_safe(
+                        [piece], height, width, original_size=original_size
+                    )
+                else:
+                    piece_mask, piece_status = (None, "seg_unsupported")
+                if piece_mask is not None:
+                    masks.append(piece_mask)
+                statuses.append(piece_status)
+    else:
+        statuses.append("seg_missing")
+
+    return merge_instance_masks(masks, height, width, statuses=statuses)
+
+
+def _merge_group_offline(
+    group_anns: Sequence[Dict],
+    height: int,
+    width: int,
+    *,
+    img_hw_map: Dict[int, Tuple[int, int]],
+) -> Tuple[np.ndarray, str]:
+    group_masks: List[np.ndarray] = []
+    statuses: List[str] = []
+    fallback_used = False
+
+    for ann in group_anns:
+        image_id = ann.get("image_id")
+        original_hw = None
+        if image_id is not None:
+            try:
+                original_hw = img_hw_map.get(int(image_id))
+            except (TypeError, ValueError):
+                original_hw = None
+
+        mask, status = _decode_annotation_offline(
+            ann,
+            height,
+            width,
+            original_size=original_hw,
+        )
+        if mask is not None and mask.sum() > 0:
+            group_masks.append(mask)
+            statuses.append(status)
+            continue
+
+        bbox_mask, bbox_status = bbox_to_mask(
+            ann.get("bbox"),
+            height,
+            width,
+            bbox_mode=ann.get("bbox_mode", "XYWH_ABS"),
+        )
+        if bbox_mask is not None and bbox_mask.sum() > 0:
+            group_masks.append(bbox_mask)
+            statuses.append(
+                "+".join([s for s in [status, bbox_status] if s]) or "bbox"
+            )
+            fallback_used = True
+        else:
+            statuses.append(status or bbox_status or "decode_fail")
+
+    merged_mask, merged_status = merge_instance_masks(group_masks, height, width, statuses=statuses)
+
+    if (merged_mask is None or merged_mask.sum() == 0) and group_anns:
+        bbox_masks: List[np.ndarray] = []
+        bbox_statuses: List[str] = []
+        for ann in group_anns:
+            bbox_mask, bbox_status = bbox_to_mask(
+                ann.get("bbox"),
+                height,
+                width,
+                bbox_mode=ann.get("bbox_mode"),
+            )
+            if bbox_mask is not None and bbox_mask.sum() > 0:
+                bbox_masks.append(bbox_mask)
+            bbox_statuses.append(bbox_status)
+        fallback_mask, fallback_status = merge_instance_masks(
+            bbox_masks,
+            height,
+            width,
+            statuses=bbox_statuses,
+        )
+        if fallback_mask is not None and fallback_mask.sum() > 0:
+            merged_mask = fallback_mask
+            merged_status = (
+                "+".join([merged_status, fallback_status])
+                if merged_status
+                else fallback_status
+            )
+            fallback_used = True
+
+    if merged_mask is None or merged_mask.sum() == 0:
+        synthetic = np.zeros((height, width), dtype=np.uint8)
+        synthetic[height // 2, width // 2] = 1
+        merged_mask = synthetic
+        merged_status = (
+            f"{merged_status}+synthetic" if merged_status else "synthetic"
+        )
+        fallback_used = True
+
+    merged_mask = np.ascontiguousarray(merged_mask.astype(np.uint8, copy=False))
+    merged_mask[merged_mask > 0] = 1
+
+    status_tokens = set()
+    for token in merged_status.split("+"):
+        token = token.strip().lower()
+        if token:
+            status_tokens.add(token)
+    label_map = {
+        "rle": "RLE",
+        "poly": "POLY",
+        "bbox": "BBOX",
+        "synthetic": "SYNTHETIC",
+    }
+    readable = " + ".join(label_map.get(tok, tok.upper()) for tok in sorted(status_tokens))
+    if not readable:
+        readable = "UNKNOWN"
+
+    return merged_mask, readable + (" (fallback)" if fallback_used else "")
+
+
+def _run_unit_check(args: argparse.Namespace) -> None:
+    if "RefCOCOMapper" not in globals() or RefCOCOMapper is None:
+        print("[Unit Check] RefCOCOMapper is unavailable (Detectron2 missing); skipping.")
         return
 
-    from detectron2.config import get_cfg
-    from detectron2.data import DatasetCatalog, build_detection_test_loader
+    try:
+        mapper = RefCOCOMapper(
+            is_train=False,
+            tfm_gens=[],
+            image_format="RGB",
+            bert_type="bert-base-uncased",
+            max_tokens=32,
+            merge=True,
+            preload_only=True,
+        )
+    except Exception as exc:
+        print(f"[Unit Check] Unable to instantiate RefCOCOMapper: {exc}")
+        raise SystemExit(1)
 
-    from gres_model.config import add_gres_config
-    from gres_model.evaluation.refer_evaluation import ReferEvaluator
+    class _DummyTokenizer:
+        def __init__(self, max_tokens: int):
+            self.max_tokens = max_tokens
 
-    # Ensure datasets are registered on import.
-    import datasets.register_miami2025  # noqa: F401
+        def encode(self, text: str, add_special_tokens: bool = True):
+            base = [100]
+            return ([101] + base + [102])[: self.max_tokens] if add_special_tokens else base[: self.max_tokens]
 
+    mapper.tokenizer = _DummyTokenizer(getattr(mapper, "max_tokens", 32))
+
+    with open(args.dataset_json, "r", encoding="utf-8") as handle:
+        dataset = json.load(handle)
+    with open(args.instances_json, "r", encoding="utf-8") as handle:
+        instances = json.load(handle)
+
+    ann_map = {int(ann["id"]): ann for ann in instances.get("annotations", [])}
+    img_map = {int(img["id"]): img for img in instances.get("images", [])}
+
+    chosen_sample = None
+    chosen_group: List[Dict] = []
+
+    for sample in dataset:
+        ann_ids = sample.get("ann_id") or []
+        if not ann_ids:
+            continue
+        resolved = []
+        missing = False
+        for ann_id in ann_ids:
+            ann = ann_map.get(int(ann_id))
+            if not ann:
+                missing = True
+                break
+            resolved.append(copy.deepcopy(ann))
+        if missing:
+            continue
+        chosen_sample = sample
+        chosen_group = resolved
+        break
+
+    if chosen_sample is None or not chosen_group:
+        print("[Unit Check] No suitable sample found in provided JSON files; skipping.")
+        return
+
+    image_id = int(chosen_sample.get("image_id", -1))
+    ann_ids = [int(x) for x in chosen_sample.get("ann_id")]
+    img_meta = img_map.get(image_id, {})
+    height = int(img_meta.get("height", chosen_sample.get("height", 1)) or 1)
+    width = int(img_meta.get("width", chosen_sample.get("width", 1)) or 1)
+    height = max(height, 1)
+    width = max(width, 1)
+
+    raw_annotations = copy.deepcopy(chosen_group)
+    transformed = []
+    for ann in chosen_group:
+        transformed.append(
+            {
+                "bbox": ann.get("bbox"),
+                "bbox_mode": "XYWH_ABS",
+                "ann_id": ann.get("id"),
+                "ann_ids": ann.get("id"),
+                "segmentation": ann.get("segmentation"),
+            }
+        )
+
+    dataset_dict = {
+        "image": np.zeros((height, width, 3), dtype=np.uint8),
+        "height": height,
+        "width": width,
+        "ann_ids": ann_ids,
+        "ann_id": ann_ids,
+        "annotations": transformed,
+        "_raw_annotations": raw_annotations,
+        "inst_json": args.instances_json,
+        "image_id": image_id,
+        "no_target": False,
+        "empty": False,
+        "dataset_name": "miami2025_train",
+    }
+
+    work_dict = copy.deepcopy(dataset_dict)
+    mask = mapper._synthesize_mask(work_dict)
+    status = work_dict.get("mask_status", {})
+    mode = status.get("mode", "UNKNOWN")
+    mask_sum = int(mask.sum()) if mask is not None else 0
+
+    if mask is None or mask.shape != (height, width) or mask_sum == 0:
+        print(
+            f"[Unit Check] FAIL sample {image_id}: mode={mode} shape={None if mask is None else mask.shape} sum={mask_sum}"
+        )
+        raise SystemExit(1)
+
+    print(
+        f"[Unit Check] PASS sample {image_id} | mode: {mode} | mask.shape {mask.shape} | sum = {mask_sum}"
+    )
+
+
+def _run_offline(args: argparse.Namespace) -> None:
+    mapper = _ensure_mapper_preloaded()
+    mapper_cache = getattr(mapper, "id_to_ann", {}) if mapper is not None else {}
+    preload_source = getattr(mapper, "preload_source", None)
+    if preload_source:
+        print(f"[Offline Test] Mapper preload source: {preload_source}")
+
+    with open(args.dataset_json, "r") as f:
+        dataset = json.load(f)
+    with open(args.instances_json, "r") as f:
+        instances = json.load(f)
+
+    ann_map: Dict[int, Dict] = {
+        int(ann["id"]): ann for ann in instances.get("annotations", [])
+    }
+    img_map: Dict[int, Dict] = {
+        int(img["id"]): img for img in instances.get("images", [])
+    }
+
+    max_samples = int(args.max_samples) if args.max_samples else None
+    selected = 0
+    targeted_checked = 0
+    synthetic_failures: List[int] = []
+    reported_missing: List[Tuple[int, List[int]]] = []
+
+    for sample in dataset:
+        if args.split and sample.get("split") != args.split:
+            continue
+        if max_samples is not None and selected >= max_samples:
+            break
+
+        image_id = int(sample.get("image_id", -1))
+        ann_ids = sample.get("ann_id") or []
+        if not ann_ids:
+            continue
+
+        img_meta = img_map.get(image_id, {})
+        height = int(img_meta.get("height", sample.get("height", 1)))
+        width = int(img_meta.get("width", sample.get("width", 1)))
+        height = max(height, 1)
+        width = max(width, 1)
+
+        grouped: Dict[str, List[Dict]] = {}
+        missing_ann_ids: List[int] = []
+        for idx, ann_id in enumerate(ann_ids):
+            ann = ann_map.get(int(ann_id))
+            if not ann and mapper_cache:
+                ann = mapper_cache.get(int(ann_id))
+            if not ann:
+                missing_ann_ids.append(int(ann_id))
+                continue
+            group_key = str(ann.get("id", ann_id))
+            grouped.setdefault(group_key, []).append(ann)
+
+        final_mask = np.zeros((height, width), dtype=np.uint8)
+        readable_tokens: List[str] = []
+        for group_key, group_anns in grouped.items():
+            group_mask, mode_label = _merge_group_offline(
+                group_anns,
+                height,
+                width,
+                img_hw_map=img_map,
+            )
+            final_mask = np.maximum(final_mask, group_mask)
+            readable_tokens.append(mode_label)
+
+        if final_mask.sum() == 0:
+            synthetic = np.zeros((height, width), dtype=np.uint8)
+            synthetic[height // 2, width // 2] = 1
+            final_mask = synthetic
+            readable_tokens.append("SYNTHETIC (fallback)")
+            if missing_ann_ids:
+                print(
+                    f"[Offline Test] Missing annotations for {missing_ann_ids} in sample {image_id}; using synthetic fallback."
+                )
+                reported_missing.append((image_id, missing_ann_ids))
+
+        final_mask = (final_mask > 0).astype(np.uint8)
+        mask_sum = int(final_mask.sum())
+        readable_summary = " | ".join(readable_tokens) if readable_tokens else "UNKNOWN"
+
+        print(
+            f"✅ sample {image_id} | mode: {readable_summary} | mask.shape {final_mask.shape} | sum = {mask_sum}"
+        )
+
+        if any("synthetic" in token.lower() for token in readable_tokens):
+            synthetic_failures.append(image_id)
+
+        if not sample.get("no_target", False):
+            assert final_mask.shape == (height, width), "Mask shape mismatch"
+            assert mask_sum > 0, "Expected non-empty mask for targeted sample"
+            targeted_checked += 1
+
+        selected += 1
+
+    if synthetic_failures:
+        print(
+            f"[Offline Test] Synthetic fallback triggered for samples {synthetic_failures}."
+        )
+    if reported_missing:
+        details = ", ".join(
+            f"{img_id}:{ids}" for img_id, ids in reported_missing
+        )
+        print(f"[Offline Test] Missing annotations encountered for {details}.")
+
+    if not synthetic_failures:
+        print(
+            f"[Offline Test] All {targeted_checked} targeted samples passed (shape match & non-empty)"
+        )
+    else:
+        if args.allow_synthetic:
+            print(
+                f"[Offline Test] Proceeding despite synthetic fallbacks (requested via --allow-synthetic)."
+            )
+        else:
+            print(
+                "[Offline Test] FAIL: synthetic fallback detected. Re-run with real instances.json or use --allow-synthetic to override."
+            )
+            raise SystemExit(1)
+
+
+def main():
     parser = argparse.ArgumentParser(description="Miami2025 evaluator smoke test")
     parser.add_argument(
         "--config-file",
@@ -109,9 +598,68 @@ def main():
         "--max-iters",
         type=int,
         default=5,
-        help="Number of dataloader batches to run before stopping.",
+        help="Number of dataloader batches to run before stopping (Detectron2 mode).",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Run mask decoding checks without Detectron2.",
+    )
+    parser.add_argument(
+        "--dataset-json",
+        default="datasets/miami2025.json",
+        help="Miami2025 referring expressions JSON (offline mode).",
+    )
+    parser.add_argument(
+        "--instances-json",
+        default="datasets/instances_sample.json",
+        help="COCO instances JSON with segmentations (offline mode).",
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        help="Dataset split to filter in offline mode (e.g., train/val).",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=5,
+        help="Number of samples to inspect in offline mode.",
+    )
+    parser.add_argument(
+        "--allow-synthetic",
+        action="store_true",
+        help="Allow offline diagnostics to pass even if synthetic fallback masks are generated.",
+    )
+    parser.add_argument(
+        "--unit-check",
+        action="store_true",
+        help="Run a minimal RefCOCOMapper unit check and exit.",
     )
     args = parser.parse_args()
+
+    if args.unit_check:
+        _run_unit_check(args)
+        return
+
+    if args.offline:
+        _run_offline(args)
+        return
+
+    if importlib.util.find_spec("detectron2") is None:
+        print(
+            "Detectron2 is not installed. Use '--offline' to run the Miami2025 mask diagnostics."
+        )
+        return
+
+    from detectron2.config import get_cfg
+    from detectron2.data import DatasetCatalog, build_detection_test_loader
+
+    from gres_model.config import add_gres_config
+    from gres_model.evaluation.refer_evaluation import ReferEvaluator
+
+    # Ensure datasets are registered on import.
+    import datasets.register_miami2025  # noqa: F401
 
     cfg = get_cfg()
     add_gres_config(cfg)
@@ -143,10 +691,13 @@ def main():
 
     first_sample = first_inputs[0]
     image_tensor = first_sample.get("image")
-    if image_tensor is not None:
+    if image_tensor is not None and torch.is_tensor(image_tensor):
         height, width = image_tensor.shape[1:]
     else:
-        height = width = 1
+        height = int(first_sample.get("height", 1))
+        width = int(first_sample.get("width", 1))
+        height = max(height, 1)
+        width = max(width, 1)
     first_mask_np = _as_numpy_mask(first_sample.get("gt_mask_merged"), height, width)
     print(f"✅ gt_mask_merged: {type(first_sample.get('gt_mask_merged'))}")
     print(f"✅ mask shape: {first_mask_np.shape}")
@@ -161,7 +712,7 @@ def main():
             image_tensor = sample.get("image")
             sample_height = sample.get("height")
             sample_width = sample.get("width")
-            if image_tensor is not None:
+            if image_tensor is not None and torch.is_tensor(image_tensor):
                 h_default, w_default = image_tensor.shape[1:3]
             else:
                 h_default = w_default = 1
@@ -194,4 +745,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
