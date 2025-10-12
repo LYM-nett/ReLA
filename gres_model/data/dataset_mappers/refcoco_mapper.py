@@ -187,29 +187,59 @@ class RefCOCOMapper:
     def _merge_masks(x):
         return x.sum(dim=0, keepdim=True).clamp(max=1)
 
+    _DEFAULT_HW = (480, 640)
+
     @staticmethod
     def _normalize_hw(height, width, fallback_shape):
-        def _safe_int(value, default=0):
+        def _safe_int(value):
             try:
                 value_i = int(value)
             except (TypeError, ValueError):
-                value_i = default
-            return value_i if value_i > 0 else default
+                return 0
+            return value_i if value_i > 0 else 0
 
-        h = _safe_int(height)
-        w = _safe_int(width)
+        def _normalize_candidate(candidate):
+            if candidate is None:
+                return None
 
-        fallback_h = 0
-        fallback_w = 0
-        if fallback_shape is not None:
-            if len(fallback_shape) >= 1:
-                fallback_h = _safe_int(fallback_shape[0])
-            if len(fallback_shape) >= 2:
-                fallback_w = _safe_int(fallback_shape[1])
+            if torch.is_tensor(candidate):  # pragma: no cover - defensive
+                if candidate.ndim >= 2:
+                    return _normalize_candidate(tuple(int(v) for v in candidate.shape[-2:]))
+                return None
 
-        h = h or fallback_h or 1
-        w = w or fallback_w or 1
-        return h, w
+            if isinstance(candidate, np.ndarray):  # pragma: no cover - defensive
+                if candidate.ndim >= 2:
+                    return _normalize_candidate(candidate.shape[-2:])
+                return None
+
+            if isinstance(candidate, dict):
+                return _normalize_candidate((candidate.get("height"), candidate.get("width")))
+
+            if isinstance(candidate, (list, tuple)):
+                if len(candidate) >= 2 and not isinstance(candidate[0], (list, tuple, dict, np.ndarray)):
+                    h_c = _safe_int(candidate[0])
+                    w_c = _safe_int(candidate[1])
+                    if h_c > 0 and w_c > 0:
+                        return h_c, w_c
+                    return None
+                for piece in candidate:
+                    normalized = _normalize_candidate(piece)
+                    if normalized is not None:
+                        return normalized
+                return None
+
+            return None
+
+        primary_h = _safe_int(height)
+        primary_w = _safe_int(width)
+        if primary_h > 0 and primary_w > 0:
+            return primary_h, primary_w
+
+        fallback = _normalize_candidate(fallback_shape)
+        if fallback is not None:
+            return fallback
+
+        return RefCOCOMapper._DEFAULT_HW
 
     @staticmethod
     def _decode_annotation_mask(ann, height, width, *, original_hw=None):
@@ -382,50 +412,28 @@ class RefCOCOMapper:
         transformed_shape = None
         image = dataset_dict.get("image")
         if torch.is_tensor(image):
-            transformed_shape = (int(image.shape[-2]), int(image.shape[-1]))
+            transformed_shape = tuple(int(dim) for dim in image.shape[-2:])
         elif isinstance(image, np.ndarray):
-            h, w = image.shape[:2]
-            transformed_shape = (int(h), int(w))
+            transformed_shape = tuple(int(dim) for dim in image.shape[:2])
 
         stored_height = dataset_dict.get("height")
         stored_width = dataset_dict.get("width")
 
-        def _valid_hw(candidate):
-            if candidate is None:
-                return None
-            if isinstance(candidate, (list, tuple)) and len(candidate) >= 2:
-                cand_h, cand_w = candidate[0], candidate[1]
-            else:
-                return None
-            try:
-                cand_h = int(cand_h)
-                cand_w = int(cand_w)
-            except (TypeError, ValueError):
-                return None
-            if cand_h <= 0 or cand_w <= 0:
-                return None
-            return cand_h, cand_w
-
-        fallback_shape = None
-        for candidate in (
-            transformed_shape,
-            (stored_height, stored_width),
-            dataset_dict.get("_original_hw"),
-        ):
-            valid = _valid_hw(candidate)
-            if valid is not None:
-                fallback_shape = valid
-                break
-
+        fallback_candidates = []
         if transformed_shape is not None:
-            height_hint, width_hint = transformed_shape
-        else:
-            height_hint, width_hint = stored_height, stored_width
+            fallback_candidates.append(transformed_shape)
+        fallback_candidates.append((stored_height, stored_width))
+        original_hw = dataset_dict.get("_original_hw")
+        if original_hw is not None:
+            fallback_candidates.append(original_hw)
+        fallback_candidates.append(self._DEFAULT_HW)
+
+        height_hint, width_hint = (transformed_shape or (stored_height, stored_width))
 
         height, width = self._normalize_hw(
             height_hint,
             width_hint,
-            fallback_shape,
+            fallback_candidates,
         )
 
         raw_annotations = dataset_dict.get("_raw_annotations") or []
@@ -458,6 +466,18 @@ class RefCOCOMapper:
                     "mask_sum": int(mask_np.sum()) if mask_np is not None else 0,
                 }
             )
+
+        def _status_to_mode(status_label):
+            tokens = {token.strip().lower() for token in str(status_label or "").split("+") if token}
+            if any("poly" in token for token in tokens):
+                return "POLY"
+            if any("rle" in token for token in tokens):
+                return "RLE"
+            if any("bbox" in token for token in tokens):
+                return "BBOX"
+            if any("synthetic" in token for token in tokens):
+                return "SYNTHETIC"
+            return "UNKNOWN"
 
         if ann_ids:
             for ann_id in ann_ids:
@@ -551,6 +571,13 @@ class RefCOCOMapper:
                 per_instance_masks.append(mask_np)
                 per_instance_statuses.append(status_label)
                 _accumulate_status(int(ann_id), status_label, mask_np)
+                logger.debug(
+                    "[RefCOCOMapper] decode ann_id=%s | mode=%s | mask.shape=%s | sum=%d",
+                    int(ann_id),
+                    _status_to_mode(status_label),
+                    tuple(mask_np.shape),
+                    int(mask_np.sum()),
+                )
 
         if not per_instance_masks and raw_annotations:
             for idx, raw_ann in enumerate(raw_annotations):
@@ -624,16 +651,16 @@ class RefCOCOMapper:
             if any("synthetic" in token for token in tokens):
                 decode_counts["synthetic"] += 1
 
-        if decode_counts["synthetic"] and not (
-            decode_counts["rle"] or decode_counts["poly"] or decode_counts["bbox"]
-        ):
-            mode_label = "SYNTHETIC"
-        elif decode_counts["rle"] + decode_counts["poly"] > 1:
-            mode_label = "MERGED"
-        elif decode_counts["rle"] + decode_counts["poly"] == 1:
-            mode_label = "MASK"
-        elif decode_counts["bbox"] > 0:
+        if decode_counts["poly"] and decode_counts["rle"]:
+            mode_label = "POLY+RLE"
+        elif decode_counts["poly"]:
+            mode_label = "POLY"
+        elif decode_counts["rle"]:
+            mode_label = "RLE"
+        elif decode_counts["bbox"]:
             mode_label = "BBOX"
+        elif decode_counts["synthetic"]:
+            mode_label = "SYNTHETIC"
         else:
             mode_label = "UNKNOWN"
 
@@ -673,6 +700,11 @@ class RefCOCOMapper:
             int(final_mask.sum()),
             fallback_used,
             source_desc,
+        )
+        logger.debug(
+            "[RefCOCOMapper] final mask | shape=%s | sum=%d",
+            tuple(final_mask.shape),
+            int(final_mask.sum()),
         )
         return final_mask
 
