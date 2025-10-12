@@ -32,6 +32,8 @@ from gres_model.utils.mask_ops import (
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_HW = (480, 640)
+
 __all__ = ["RefCOCOMapper"]
 
 
@@ -196,20 +198,89 @@ class RefCOCOMapper:
                 value_i = default
             return value_i if value_i > 0 else default
 
+        def _coerce_shape(shape_candidate):
+            if shape_candidate is None:
+                return 0, 0
+            if isinstance(shape_candidate, (list, tuple)):
+                values = list(shape_candidate)
+            elif hasattr(shape_candidate, "shape"):
+                shape_attr = getattr(shape_candidate, "shape")
+                if isinstance(shape_attr, (list, tuple)):
+                    values = list(shape_attr)
+                else:
+                    try:
+                        values = list(shape_attr)
+                    except TypeError:
+                        return 0, 0
+                values = values[-2:]
+            else:
+                return 0, 0
+            if len(values) == 1:
+                values = [values[0], values[0]]
+            if len(values) >= 2:
+                return _safe_int(values[-2]), _safe_int(values[-1])
+            return 0, 0
+
         h = _safe_int(height)
         w = _safe_int(width)
 
-        fallback_h = 0
-        fallback_w = 0
-        if fallback_shape is not None:
-            if len(fallback_shape) >= 1:
-                fallback_h = _safe_int(fallback_shape[0])
-            if len(fallback_shape) >= 2:
-                fallback_w = _safe_int(fallback_shape[1])
+        fallback_h, fallback_w = _coerce_shape(fallback_shape)
 
-        h = h or fallback_h or 1
-        w = w or fallback_w or 1
-        return h, w
+        if not h:
+            h = fallback_h
+        if not w:
+            w = fallback_w
+
+        if not h or not w:
+            logger.debug(
+                "[RefCOCOMapper] Falling back to default spatial size %s (input h=%s, w=%s, fallback=%s)",
+                _DEFAULT_HW,
+                height,
+                width,
+                fallback_shape,
+            )
+            h = h or _DEFAULT_HW[0]
+            w = w or _DEFAULT_HW[1]
+
+        return int(h), int(w)
+
+    @staticmethod
+    def _extract_ann_identifier(obj):
+        if not isinstance(obj, dict):
+            return "unknown"
+        keys = ("ann_id", "ann_ids", "id")
+        for key in keys:
+            value = obj.get(key)
+            if isinstance(value, (list, tuple)):
+                for candidate in value:
+                    try:
+                        return int(candidate)
+                    except (TypeError, ValueError):
+                        if candidate is not None:
+                            return str(candidate)
+            elif value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    return str(value)
+        return "unknown"
+
+    @staticmethod
+    def _log_decode_result(ann_identifier, mode, mask, status=None):
+        if mask is None:
+            mask_shape = None
+            mask_sum = 0
+        else:
+            mask_shape = tuple(mask.shape)
+            mask_sum = int(np.asarray(mask).sum())
+        logger.debug(
+            "[RefCOCOMapper] ann_id=%s | mode=%s | status=%s | mask.shape=%s | mask.sum=%d",
+            ann_identifier,
+            mode,
+            status or "",
+            mask_shape,
+            mask_sum,
+        )
 
     @staticmethod
     def _decode_annotation_mask(ann, height, width, *, original_hw=None):
@@ -224,6 +295,8 @@ class RefCOCOMapper:
                     original_size = (oh, ow)
             except (TypeError, ValueError):
                 original_size = None
+
+        ann_identifier = RefCOCOMapper._extract_ann_identifier(ann)
 
         if isinstance(seg, dict):
             mask, status = _rle_to_mask_safe(seg, height, width, original_size=original_size)
@@ -256,7 +329,21 @@ class RefCOCOMapper:
         else:
             statuses.append("seg_missing")
 
-        return merge_instance_masks(masks, height, width, statuses=statuses)
+        mask, merged_status = merge_instance_masks(masks, height, width, statuses=statuses)
+        status_token = str(merged_status or "").lower()
+        if "poly" in status_token:
+            mode = "POLY"
+        elif "rle" in status_token:
+            mode = "RLE"
+        elif "bbox" in status_token:
+            mode = "BBOX"
+        elif "synthetic" in status_token:
+            mode = "SYNTHETIC"
+        else:
+            mode = "UNKNOWN"
+
+        RefCOCOMapper._log_decode_result(ann_identifier, mode, mask, merged_status)
+        return mask, merged_status
 
     @staticmethod
     def _collect_ann_ids(dataset_dict, raw_annotations):
@@ -503,6 +590,7 @@ class RefCOCOMapper:
                         mask_np = bbox_mask
                         mask_sum = int(bbox_mask.sum())
                         fallback_used = True
+                        self._log_decode_result(ann_key, "BBOX", bbox_mask, bbox_status)
 
                 if ann_record is None:
                     missing_ann_ids.append(ann_key)
@@ -545,6 +633,7 @@ class RefCOCOMapper:
                     mask_sum = 1
                     statuses.append("synthetic")
                     fallback_used = True
+                    self._log_decode_result(ann_key, "SYNTHETIC", synthetic_mask, "synthetic")
 
                 status_label = "+".join([s for s in statuses if s]) or "missing"
                 mask_np = np.ascontiguousarray((mask_np > 0).astype(np.uint8, copy=False))
@@ -607,6 +696,7 @@ class RefCOCOMapper:
             final_mask = synthetic_mask
             fallback_used = True
             _accumulate_status("synthetic_fallback", "synthetic", final_mask)
+            self._log_decode_result("final", "SYNTHETIC", synthetic_mask, "synthetic_fallback")
 
         final_mask = np.ascontiguousarray((final_mask > 0).astype(np.uint8, copy=False))
         dataset_dict["height"], dataset_dict["width"] = height, width
@@ -674,6 +764,7 @@ class RefCOCOMapper:
             fallback_used,
             source_desc,
         )
+        self._log_decode_result("final", mode_label.upper(), final_mask, merged_status)
         return final_mask
 
     def __call__(self, dataset_dict):
