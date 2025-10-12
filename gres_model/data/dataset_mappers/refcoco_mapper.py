@@ -262,6 +262,7 @@ class RefCOCOMapper:
     def _collect_ann_ids(dataset_dict, raw_annotations):
         ann_ids = []
         candidates = []
+        negative_ids = []
         for key in ("ann_ids", "ann_id", "ann_id_list", "annotation_ids"):
             value = dataset_dict.get(key)
             if isinstance(value, (list, tuple)):
@@ -283,9 +284,15 @@ class RefCOCOMapper:
                 cid = int(cand)
             except (TypeError, ValueError):
                 continue
+            if cid < 0:
+                if cid not in negative_ids:
+                    negative_ids.append(cid)
+                continue
             if cid not in seen:
                 seen.add(cid)
                 ann_ids.append(cid)
+        if negative_ids:
+            dataset_dict["_negative_ann_ids"] = negative_ids
         return ann_ids
 
     @classmethod
@@ -379,16 +386,31 @@ class RefCOCOMapper:
     def _synthesize_mask(self, dataset_dict):
         fallback_shape = None
         image = dataset_dict.get("image")
+        image_hw = None
         if torch.is_tensor(image):
-            fallback_shape = (int(image.shape[-2]), int(image.shape[-1]))
+            image_hw = (int(image.shape[-2]), int(image.shape[-1]))
         elif isinstance(image, np.ndarray):
-            fallback_shape = image.shape[:2]
+            image_hw = tuple(int(v) for v in image.shape[:2])
 
-        height, width = self._normalize_hw(
-            dataset_dict.get("height"),
-            dataset_dict.get("width"),
-            fallback_shape,
-        )
+        fallback_shape = image_hw
+
+        if image_hw is not None and min(image_hw) > 0:
+            height, width = image_hw
+        else:
+            height, width = self._normalize_hw(
+                dataset_dict.get("height"),
+                dataset_dict.get("width"),
+                fallback_shape,
+            )
+
+        original_hw = dataset_dict.get("_original_hw")
+        if isinstance(original_hw, (list, tuple)) and len(original_hw) >= 2:
+            try:
+                original_hw = (int(original_hw[0]), int(original_hw[1]))
+            except (TypeError, ValueError):
+                original_hw = None
+        else:
+            original_hw = None
 
         raw_annotations = dataset_dict.get("_raw_annotations") or []
         transformed_annotations = dataset_dict.get("annotations", []) or []
@@ -420,6 +442,14 @@ class RefCOCOMapper:
                     "mask_sum": int(mask_np.sum()) if mask_np is not None else 0,
                 }
             )
+
+        negative_ann_ids = dataset_dict.get("_negative_ann_ids", []) or []
+        for neg_id in negative_ann_ids:
+            try:
+                neg_id_int = int(neg_id)
+            except (TypeError, ValueError):
+                neg_id_int = -1
+            _accumulate_status(neg_id_int, "ignored_negative_ann_id", None)
 
         if ann_ids:
             for ann_id in ann_ids:
@@ -474,7 +504,7 @@ class RefCOCOMapper:
                             raw_ann,
                             height,
                             width,
-                            original_hw=fallback_shape,
+                            original_hw=original_hw,
                         )
                         if decode_status:
                             statuses.append(decode_status)
@@ -518,7 +548,7 @@ class RefCOCOMapper:
                     raw_ann,
                     height,
                     width,
-                    original_hw=fallback_shape,
+                    original_hw=original_hw,
                 )
                 if decoded_mask is None or decoded_mask.sum() == 0:
                     continue
@@ -584,15 +614,20 @@ class RefCOCOMapper:
             if any("synthetic" in token for token in tokens):
                 decode_counts["synthetic"] += 1
 
-        if decode_counts["synthetic"] and not (
-            decode_counts["rle"] or decode_counts["poly"] or decode_counts["bbox"]
-        ):
+        poly_count = decode_counts.get("poly", 0)
+        rle_count = decode_counts.get("rle", 0)
+        bbox_count = decode_counts.get("bbox", 0)
+        synthetic_count = decode_counts.get("synthetic", 0)
+
+        if synthetic_count and not (poly_count or rle_count or bbox_count):
             mode_label = "SYNTHETIC"
-        elif decode_counts["rle"] + decode_counts["poly"] > 1:
+        elif poly_count and rle_count:
             mode_label = "MERGED"
-        elif decode_counts["rle"] + decode_counts["poly"] == 1:
-            mode_label = "MASK"
-        elif decode_counts["bbox"] > 0:
+        elif poly_count:
+            mode_label = "POLY"
+        elif rle_count:
+            mode_label = "RLE"
+        elif bbox_count:
             mode_label = "BBOX"
         else:
             mode_label = "UNKNOWN"
@@ -609,7 +644,10 @@ class RefCOCOMapper:
             "mode": mode_label,
             "missing_ann_ids": missing_ann_ids,
             "used_synthetic": decode_counts["synthetic"] > 0,
+            "negative_ann_ids": [int(v) for v in negative_ann_ids],
         }
+
+        dataset_dict.pop("_negative_ann_ids", None)
 
         image_id = dataset_dict.get("image_id", "unknown")
         ann_summary = dataset_dict.get("ann_ids") or dataset_dict.get("ann_id") or []
@@ -644,13 +682,41 @@ class RefCOCOMapper:
         if "ann_id" not in dataset_dict and "ann_ids" in dataset_dict:
             dataset_dict["ann_id"] = dataset_dict.get("ann_ids")
 
-        no_target_flag = bool(dataset_dict.get("no_target", False))
+        ann_field = dataset_dict.get("ann_ids")
+        ann_candidates = []
+        if isinstance(ann_field, (list, tuple)):
+            for value in ann_field:
+                try:
+                    ann_candidates.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+        elif ann_field is not None:
+            try:
+                ann_candidates.append(int(ann_field))
+            except (TypeError, ValueError):
+                ann_candidates = []
+
+        has_negative_ann = bool(ann_candidates) and all(val < 0 for val in ann_candidates)
+
+        no_target_flag = bool(dataset_dict.get("no_target", False)) or has_negative_ann
         dataset_dict["no_target"] = no_target_flag
         dataset_dict["empty"] = bool(dataset_dict.get("empty", no_target_flag))
 
         _src = dataset_dict.get("source", "miami2025")
         image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
         utils.check_image_size(dataset_dict, image)
+
+        original_height = dataset_dict.get("height")
+        original_width = dataset_dict.get("width")
+        try:
+            oh = int(original_height)
+            ow = int(original_width)
+        except (TypeError, ValueError):
+            oh, ow = 0, 0
+        if oh > 0 and ow > 0:
+            dataset_dict["_original_hw"] = (oh, ow)
+        else:
+            dataset_dict["_original_hw"] = None
 
         # TODO: get padding mask
         # by feeding a "segmentation mask" to the same transforms
