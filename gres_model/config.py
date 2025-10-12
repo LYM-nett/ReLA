@@ -155,3 +155,15 @@ def add_gres_config(cfg):
     add_maskformer2_config(cfg)
     add_refcoco_config(cfg)
     add_lqm_config(cfg)
+    add_rela_config(cfg)
+
+
+def add_rela_config(cfg):
+    """Register ReLA-specific dataset mapper options."""
+
+    if not hasattr(cfg, "DATASETS"):
+        cfg.DATASETS = CN()
+    # Detectron2's ``CfgNode`` allows assignment of new keys on existing nodes.
+    # We provide defaults so downstream YAML merges can override safely.
+    cfg.DATASETS.TRAIN_MAPPER = "RefCOCOMapper"
+    cfg.DATASETS.TEST_MAPPER = "RefCOCOMapper"
