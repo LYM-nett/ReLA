@@ -41,7 +41,7 @@ from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
 
-from gres_model.config import add_gres_config
+from gres_model.config import add_gres_config, add_rela_config
 
 # MaskFormer
 from gres_model import (
@@ -76,12 +76,18 @@ class Trainer(DefaultTrainer):
     @classmethod
     def build_train_loader(cls, cfg):
         assert cfg.INPUT.DATASET_MAPPER_NAME == "refcoco"
+        mapper_name = getattr(cfg.DATASETS, "TRAIN_MAPPER", "RefCOCOMapper")
+        if mapper_name != "RefCOCOMapper":
+            raise ValueError(f"Unsupported TRAIN_MAPPER {mapper_name}; expected RefCOCOMapper")
         mapper = RefCOCOMapper(cfg, True)
         return build_detection_train_loader(cfg, mapper=mapper)
 
     @classmethod
     def build_test_loader(cls, cfg, dataset_name):
         assert cfg.INPUT.DATASET_MAPPER_NAME == "refcoco"
+        mapper_name = getattr(cfg.DATASETS, "TEST_MAPPER", "RefCOCOMapper")
+        if mapper_name != "RefCOCOMapper":
+            raise ValueError(f"Unsupported TEST_MAPPER {mapper_name}; expected RefCOCOMapper")
         mapper = RefCOCOMapper(cfg, False)
         return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
 
@@ -190,6 +196,7 @@ def setup(args):
     add_maskformer2_config(cfg)
     add_refcoco_config(cfg)
     add_gres_config(cfg)
+    add_rela_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()

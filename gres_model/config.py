@@ -155,3 +155,12 @@ def add_gres_config(cfg):
     add_maskformer2_config(cfg)
     add_refcoco_config(cfg)
     add_lqm_config(cfg)
+
+
+def add_rela_config(cfg):
+    """Register ReLA-specific dataset mapper configuration keys."""
+
+    if "TRAIN_MAPPER" not in cfg.DATASETS:
+        cfg.DATASETS.TRAIN_MAPPER = "RefCOCOMapper"
+    if "TEST_MAPPER" not in cfg.DATASETS:
+        cfg.DATASETS.TEST_MAPPER = "RefCOCOMapper"
