@@ -232,23 +232,33 @@ class RefCOCOMapper:
                 "[RefCOCOMapper] No valid height/width sources provided; cannot proceed"
             )
 
-        trusted_names = {name for name, _ in valid_sources if name in {"image_tensor", "instances_json"}}
+        trusted_set = {"image_tensor", "instances_json"}
+        trusted_names = {name for name, _ in valid_sources if name in trusted_set}
         if not trusted_names:
             raise AssertionError(
                 "[RefCOCOMapper] Missing trusted height/width source (image tensor or instances.json)"
             )
 
-        unique_dims = {dims for _, dims in valid_sources}
+        def _score(item: Tuple[str, Tuple[int, int]]):
+            name, (h, w) = item
+            priority = 1 if name in trusted_set else 0
+            return (priority, h * w)
 
-                # 如果存在多个候选尺寸，不再直接抛错，而是取面积最大的那一组
+        unique_dims = {dims for _, dims in valid_sources}
         if len(unique_dims) > 1:
-            print(f"[RefCOCOMapper] Warning: Conflicting H/W sources {valid_sources}, auto-resolving...")
-            # 过滤掉无效尺寸（≤1）
-            valid_hw = [hw for hw in unique_dims if hw[0] > 1 and hw[1] > 1]
-            # 取面积最大的尺寸，通常是原图大小
-            height, width = max(valid_hw, key=lambda x: x[0] * x[1])
-        else:
-            height, width = next(iter(unique_dims))
+            logger.warning(
+                "[RefCOCOMapper] Warning: Conflicting H/W sources %s, auto-resolving...",
+                valid_sources,
+            )
+
+        best_source, (height, width) = max(valid_sources, key=_score)
+        if (height, width) in unique_dims and len(unique_dims) > 1:
+            logger.debug(
+                "[RefCOCOMapper] Resolved H/W using %s -> (%d, %d)",
+                best_source,
+                height,
+                width,
+            )
 
         if dataset_dict is not None:
             assertions = dataset_dict.setdefault("_mask_assertions", {})
@@ -666,94 +676,59 @@ class RefCOCOMapper:
 
             if ann_record is not None and ann_record.get("bbox") is not None:
                 try:
-                # 1) 取 COCO bbox，并转换到 XYXY
-                bbox_mode = ann_record.get("bbox_mode", BoxMode.XYWH_ABS)
-                xyxy = BoxMode.convert(ann_record.get("bbox"), bbox_mode, BoxMode.XYXY_ABS)
-
-                # 2) 计算 mask 在当前 (height, width) 画布下的外接矩形
-                ys, xs = np.nonzero(mask_np)
-                mask_x0 = int(xs.min()) if xs.size else 0
-                mask_y0 = int(ys.min()) if ys.size else 0
-                mask_x1 = int(xs.max() + 1) if xs.size else 0
-                mask_y1 = int(ys.max() + 1) if ys.size else 0
-
-                # 3) 把 COCO 原图坐标的 bbox 缩放到当前画布坐标系
-                #    original_candidate：你上面已经根据 ann_record/image_id 推过来的“原图尺寸”
-                ref_hw = original_candidate or dataset_dict.get("_original_hw")
-                if ref_hw is None:
-                    ref_hw = (height, width)  # 兜底：若未知则视为同一坐标系
-
-                oh, ow = int(ref_hw[0]), int(ref_hw[1])
-                if oh <= 0 or ow <= 0:
-                    oh, ow = height, width
-
-                # 目标坐标系 = (height, width)
-                sx = float(width) / float(ow)
-                sy = float(height) / float(oh)
-
-                bx0 = xyxy[0] * sx
-                by0 = xyxy[1] * sy
-                bx1 = xyxy[2] * sx
-                by1 = xyxy[3] * sy
-
-                # 4) 设置容差：考虑取整 & 栅格化误差（随分辨率自适应）
-                tol = max(1.5, 0.005 * float(max(height, width)))
-
-                # 5) 判断是否 bbox 覆盖住 mask 外接矩形（在同一坐标系下）
-                coords_ok = (
-                    mask_x0 >= math.floor(bx0 - tol)
-                    and mask_y0 >= math.floor(by0 - tol)
-                    and mask_x1 <= math.ceil(bx1 + tol)
-                    and mask_y1 <= math.ceil(by1 + tol)
-                )
-
-                # 6) 仅当本实例“使用了 bbox 回退生成 mask”时才强约束；否则降级为 warning
-                is_bbox_used = any(("bbox" in s.lower()) for s in current_status)
-
-                assertions["coords_contract_ok"] = bool(coords_ok)
-                if not coords_ok:
-                    msg = (
-                        f"[RefCOCOMapper] coords_contract mismatch (scaled bbox "
-                        f"({bx0:.1f},{by0:.1f},{bx1:.1f},{by1:.1f}) vs "
-                        f"mask_box ({mask_x0},{mask_y0},{mask_x1},{mask_y1})) "
-                        f"@canvas ({height},{width}), tol={tol:.2f}, ann_id={ann_key}"
-                    )
-                    if is_bbox_used:
-                        # bbox 回退时必须满足契约：否则说明 bbox→mask 或尺寸对齐有问题
-                        logger.error(msg)
-                        raise AssertionError("coords_contract_ok")
-                    else:
-                        # poly/RLE 情况下常见 1-2px 漂移：记录告警但不中断训练
-                        logger.warning(msg)
-
-            except Exception as exc:
-                logger.error(
-                    "[RefCOCOMapper] Coordinate contract failure for ann_id=%s: %s",
-                    ann_key,
-                    exc,
-                )
-                raise
-
-            
-            if ann_record is not None and ann_record.get("bbox") is not None:
-                try:
+                    # 1) 将 COCO bbox 转换为 XYXY 绝对坐标
                     bbox_mode = ann_record.get("bbox_mode", BoxMode.XYWH_ABS)
                     xyxy = BoxMode.convert(ann_record.get("bbox"), bbox_mode, BoxMode.XYXY_ABS)
+
+                    # 2) 计算 mask 在当前 (height, width) 画布下的外接矩形
                     ys, xs = np.nonzero(mask_np)
-                    mask_x0 = xs.min()
-                    mask_y0 = ys.min()
-                    mask_x1 = xs.max() + 1
-                    mask_y1 = ys.max() + 1
-                    tol = 1.5
+                    mask_x0 = int(xs.min()) if xs.size else 0
+                    mask_y0 = int(ys.min()) if ys.size else 0
+                    mask_x1 = int(xs.max() + 1) if xs.size else 0
+                    mask_y1 = int(ys.max() + 1) if ys.size else 0
+
+                    # 3) 选择参考分辨率，将 bbox 缩放到当前画布坐标系
+                    ref_hw = original_candidate or dataset_dict.get("_original_hw")
+                    if ref_hw is None:
+                        ref_hw = (height, width)
+
+                    oh, ow = int(ref_hw[0]), int(ref_hw[1])
+                    if oh <= 0 or ow <= 0:
+                        oh, ow = height, width
+
+                    sx = float(width) / float(ow)
+                    sy = float(height) / float(oh)
+
+                    bx0 = xyxy[0] * sx
+                    by0 = xyxy[1] * sy
+                    bx1 = xyxy[2] * sx
+                    by1 = xyxy[3] * sy
+
+                    # 4) 设置容差，兼容不同分辨率和栅格化误差
+                    tol = max(1.5, 0.005 * float(max(height, width)))
+
                     coords_ok = (
-                        mask_x0 >= math.floor(xyxy[0] - tol)
-                        and mask_y0 >= math.floor(xyxy[1] - tol)
-                        and mask_x1 <= math.ceil(xyxy[2] + tol)
-                        and mask_y1 <= math.ceil(xyxy[3] + tol)
+                        mask_x0 >= math.floor(bx0 - tol)
+                        and mask_y0 >= math.floor(by0 - tol)
+                        and mask_x1 <= math.ceil(bx1 + tol)
+                        and mask_y1 <= math.ceil(by1 + tol)
                     )
-                    assertions["coords_contract_ok"] = coords_ok
+
+                    is_bbox_used = any(("bbox" in s.lower()) for s in current_status)
+                    assertions["coords_contract_ok"] = bool(coords_ok)
+
                     if not coords_ok:
-                        raise AssertionError("coords_contract_ok")
+                        msg = (
+                            f"[RefCOCOMapper] coords_contract mismatch (scaled bbox "
+                            f"({bx0:.1f},{by0:.1f},{bx1:.1f},{by1:.1f}) vs "
+                            f"mask_box ({mask_x0},{mask_y0},{mask_x1},{mask_y1})) "
+                            f"@canvas ({height},{width}), tol={tol:.2f}, ann_id={ann_key}"
+                        )
+                        if is_bbox_used:
+                            logger.error(msg)
+                            raise AssertionError("coords_contract_ok")
+                        logger.warning(msg)
+
                 except Exception as exc:
                     logger.error(
                         "[RefCOCOMapper] Coordinate contract failure for ann_id=%s: %s",
@@ -1048,3 +1023,76 @@ class RefCOCOMapper:
         resized = F.interpolate(tensor, size=(height, width), mode="nearest")
         return resized.squeeze(0).squeeze(0).to(dtype=torch.uint8).cpu().numpy()
 
+
+def _run_internal_tests():
+    """Run lightweight internal checks for shape normalization and contract logic."""
+
+    logging.basicConfig(level=logging.INFO)
+
+    mapper = RefCOCOMapper(
+        is_train=False,
+        tfm_gens=[],
+        image_format="RGB",
+        preload_only=True,
+    )
+
+    # Prepare synthetic annotations for two samples
+    mapper.id_to_ann = {
+        1: {
+            "id": 1,
+            "image_id": 100,
+            "segmentation": [[1.0, 1.0, 4.0, 1.0, 4.0, 3.0, 1.0, 3.0]],
+            "bbox": [1.0, 1.0, 3.0, 2.0],
+            "bbox_mode": BoxMode.XYWH_ABS,
+        },
+        2: {
+            "id": 2,
+            "image_id": 100,
+            "segmentation": [[0.5, 0.5, 3.5, 0.5, 3.5, 2.5, 0.5, 2.5]],
+            "bbox": [0.0, 0.0, 2.0, 2.0],  # Deliberately loose to trigger warning
+            "bbox_mode": BoxMode.XYWH_ABS,
+        },
+    }
+
+    base_dataset = {
+        "image": torch.zeros((3, 4, 6), dtype=torch.uint8),
+        "height": 4,
+        "width": 6,
+        "_original_hw": (4, 6),
+        "dataset_name": "unit_test",
+        "image_id": 100,
+        "no_target": False,
+        "empty": False,
+        "source": "unit-test",
+    }
+
+    hw_assertions = {"_mask_assertions": {}}
+    norm_hw = RefCOCOMapper._normalize_hw(
+        [
+            ("image_tensor", (4, 6)),
+            ("dataset_fields", (5, 5)),
+            ("original_hw", (4, 6)),
+            ("instances_json", (4, 6)),
+        ],
+        dataset_dict=hw_assertions,
+    )
+    print(f"[RefCOCOMapper][test] normalized_hw={norm_hw} assertions={hw_assertions['_mask_assertions']}")
+
+    for ann_id in (1, 2):
+        sample = copy.deepcopy(base_dataset)
+        sample["ann_ids"] = [ann_id]
+        sample["ann_id"] = ann_id
+        sample["_raw_annotations"] = [{"ann_id": ann_id}]
+        sample["annotations"] = []
+        sample["_mask_assertions"] = {}
+
+        mask = mapper._synthesize_mask(sample)
+        coords_ok = sample.get("_mask_assertions", {}).get("coords_contract_ok")
+        print(
+            f"[RefCOCOMapper][test] ann_id={ann_id} mask_hw={mask.shape if mask is not None else None} "
+            f"coords_contract_ok={coords_ok}"
+        )
+
+
+if __name__ == "__main__":
+    _run_internal_tests()
