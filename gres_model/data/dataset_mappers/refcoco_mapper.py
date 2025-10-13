@@ -1,9 +1,10 @@
+import math
 import time
 import copy
 import json
 import logging
 import os
-from typing import List
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -129,7 +130,8 @@ class RefCOCOMapper:
             logging.getLogger(__name__).info(
                 "Loading BERT tokenizer: {}...".format(self.bert_type)
             )
-            self.tokenizer = BertTokenizer.from_pretrained(self.bert_type)
+            self.tokenizer = BertTokenizer.from_pretrained("/autodl-tmp/bert-base-uncased")
+
         else:
             self.tokenizer = None
 
@@ -188,31 +190,220 @@ class RefCOCOMapper:
         return x.sum(dim=0, keepdim=True).clamp(max=1)
 
     @staticmethod
-    def _normalize_hw(height, width, fallback_shape):
-        def _safe_int(value, default=0):
-            try:
-                value_i = int(value)
-            except (TypeError, ValueError):
-                value_i = default
-            return value_i if value_i > 0 else default
-
-        h = _safe_int(height)
-        w = _safe_int(width)
-
-        fallback_h = 0
-        fallback_w = 0
-        if fallback_shape is not None:
-            if len(fallback_shape) >= 1:
-                fallback_h = _safe_int(fallback_shape[0])
-            if len(fallback_shape) >= 2:
-                fallback_w = _safe_int(fallback_shape[1])
-
-        h = h or fallback_h or 1
-        w = w or fallback_w or 1
-        return h, w
+    def _parse_hw(value: Optional[Sequence[int]]) -> Optional[Tuple[int, int]]:
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple, np.ndarray)):
+            if len(value) < 2:
+                return None
+            cand_h, cand_w = value[0], value[1]
+        else:
+            return None
+        try:
+            if isinstance(cand_h, np.ndarray):
+                cand_h = cand_h.item()
+            if isinstance(cand_w, np.ndarray):
+                cand_w = cand_w.item()
+            cand_h = int(round(float(cand_h)))
+            cand_w = int(round(float(cand_w)))
+        except (TypeError, ValueError):
+            return None
+        if cand_h <= 1 or cand_w <= 1:
+            return None
+        return cand_h, cand_w
 
     @staticmethod
-    def _decode_annotation_mask(ann, height, width, *, original_hw=None):
+    def _infer_canvas_hw_from_segmentation(segmentation) -> Optional[Tuple[int, int]]:
+        if not segmentation:
+            return None
+
+        def _sanitize_from_size(size_obj) -> Optional[Tuple[int, int]]:
+            if not isinstance(size_obj, (list, tuple)) or len(size_obj) < 2:
+                return None
+            try:
+                sh = int(round(float(size_obj[0])))
+                sw = int(round(float(size_obj[1])))
+            except (TypeError, ValueError):
+                return None
+            if sh <= 1 or sw <= 1:
+                return None
+            return sh, sw
+
+        if isinstance(segmentation, dict):
+            size = segmentation.get("size")
+            size_dims = _sanitize_from_size(size)
+            if size_dims:
+                return size_dims
+            return None
+
+        max_x = 0.0
+        max_y = 0.0
+        found_poly = False
+        if isinstance(segmentation, (list, tuple)):
+            for piece in segmentation:
+                if isinstance(piece, dict):
+                    dims = RefCOCOMapper._infer_canvas_hw_from_segmentation(piece)
+                    if dims:
+                        return dims
+                    continue
+                if not isinstance(piece, (list, tuple)):
+                    continue
+                coords: List[float] = []
+                for coord in piece:
+                    try:
+                        coords.append(float(coord))
+                    except (TypeError, ValueError):
+                        continue
+                if len(coords) < 2:
+                    continue
+                xs = coords[0::2]
+                ys = coords[1::2]
+                if xs:
+                    max_x = max(max_x, max(xs))
+                if ys:
+                    max_y = max(max_y, max(ys))
+                found_poly = True
+
+        if not found_poly:
+            return None
+
+        height = int(math.ceil(max_y + 1.0))
+        width = int(math.ceil(max_x + 1.0))
+        if height <= 1 or width <= 1:
+            return None
+        return height, width
+
+    @staticmethod
+    def _infer_canvas_hw_from_annotation(ann: Dict[str, object]) -> Optional[Tuple[int, int]]:
+        if not isinstance(ann, dict):
+            return None
+
+        seg_dims = RefCOCOMapper._infer_canvas_hw_from_segmentation(ann.get("segmentation"))
+        if seg_dims:
+            return seg_dims
+
+        bbox = ann.get("bbox")
+        if bbox is not None:
+            bbox_mode = ann.get("bbox_mode", BoxMode.XYWH_ABS)
+            try:
+                x0, y0, x1, y1 = BoxMode.convert(bbox, bbox_mode, BoxMode.XYXY_ABS)
+                width = int(math.ceil(max(x1, 0.0)))
+                height = int(math.ceil(max(y1, 0.0)))
+                if height > 1 and width > 1:
+                    return height, width
+            except Exception:
+                logger.debug(
+                    "[RefCOCOMapper] Failed to infer canvas from bbox for ann_id=%s",
+                    ann.get("id"),
+                )
+        return None
+
+    @classmethod
+    def _normalize_hw(
+        cls,
+        sources: Sequence[Tuple[str, Optional[Sequence[int]]]],
+        *,
+        dataset_dict: Optional[Dict[str, object]] = None,
+    ) -> Tuple[int, int]:
+        """Resolve a unique ``(height, width)`` pair from trusted sources."""
+
+        valid_sources: List[Tuple[str, Tuple[int, int]]] = []
+        for name, candidate in sources:
+            parsed = cls._parse_hw(candidate)
+            if parsed is not None:
+                valid_sources.append((name, parsed))
+
+        if not valid_sources:
+            raise AssertionError(
+                "[RefCOCOMapper] No valid height/width sources provided; cannot proceed"
+            )
+
+        trusted_names = {
+            name
+            for name, _ in valid_sources
+            if name in {"image_tensor", "instances_json", "poly_bounds"}
+        }
+        if not trusted_names:
+            raise AssertionError(
+                "[RefCOCOMapper] Missing trusted height/width source (image tensor or instances.json)"
+            )
+
+        priority = {
+            "image_tensor": 0,
+            "instances_json": 1,
+            "poly_bounds": 2,
+            "dataset_fields": 3,
+            "original_hw": 4,
+        }
+
+        candidates: List[Tuple[bool, int, int, int, str, Tuple[int, int]]] = []
+        for idx, (name, dims) in enumerate(valid_sources):
+            h, w = dims
+            area = max(h, 0) * max(w, 0)
+            non_trivial = h > 1 and w > 1
+            trust_rank = priority.get(name, 10)
+            candidates.append((non_trivial, area, -trust_rank, -idx, name, dims))
+
+        unique_dims = {entry[-1] for entry in candidates}
+        if len(unique_dims) > 1:
+            logger.warning(
+                f"[RefCOCOMapper] Warning: Conflicting H/W sources {valid_sources}, auto-resolving..."
+            )
+
+        non_trivial_candidates = [c for c in candidates if c[0]]
+        search_space = non_trivial_candidates or candidates
+        best = max(search_space, key=lambda item: (item[1], item[2], item[3]))
+        height, width = best[-1]
+
+        if height <= 1 or width <= 1:
+            # Final safeguard: pick the largest area even if degenerate.
+            fallback = max(candidates, key=lambda item: (item[1], item[2], item[3]))
+            height, width = fallback[-1]
+
+        if dataset_dict is not None:
+            assertions = dataset_dict.setdefault("_mask_assertions", {})
+            assertions["has_hw_from_images_json"] = (
+                "instances_json" in trusted_names
+                or "image_tensor" in trusted_names
+                or "poly_bounds" in trusted_names
+            )
+            assertions["no_1x1_anywhere"] = height > 1 and width > 1
+
+        assert height > 1 and width > 1, "[RefCOCOMapper] Invalid normalized shape"
+        return height, width
+
+    @staticmethod
+    def _status_to_mode(status):
+        tokens = str(status or "").lower().replace("(", "+").replace(")", "").split("+")
+        for token in tokens:
+            token = token.strip()
+            if not token:
+                continue
+            if "poly" in token:
+                return "POLY"
+            if "rle" in token:
+                return "RLE"
+            if "bbox" in token:
+                return "BBOX"
+            if "synthetic" in token:
+                return "SYNTHETIC"
+        return "UNKNOWN"
+
+    @staticmethod
+    def _decode_annotation_mask(
+        ann: Dict[str, object],
+        height: int,
+        width: int,
+        *,
+        original_hw: Optional[Sequence[int]] = None,
+        dataset_dict: Optional[Dict[str, object]] = None,
+    ):
+        assert height > 1 and width > 1, "decode_inputs_have_hw"
+        if dataset_dict is not None:
+            gates = dataset_dict.setdefault("_mask_assertions", {})
+            gates.setdefault("polygon_even_len", True)
+            gates.setdefault("rle_counts_is_str", True)
+            gates["decode_inputs_have_hw"] = True
         seg = ann.get("segmentation")
         masks = []
         statuses = []
@@ -220,12 +411,20 @@ class RefCOCOMapper:
         if original_hw:
             try:
                 oh, ow = int(original_hw[0]), int(original_hw[1])
-                if oh > 0 and ow > 0:
+                if oh > 1 and ow > 1:
                     original_size = (oh, ow)
             except (TypeError, ValueError):
                 original_size = None
 
+        def _mark_gate(name: str, ok: bool):
+            if dataset_dict is None:
+                return
+            dataset_dict.setdefault("_mask_assertions", {})[name] = bool(ok)
+
         if isinstance(seg, dict):
+            counts = seg.get("counts") if isinstance(seg, dict) else None
+            if counts is not None:
+                _mark_gate("rle_counts_is_str", isinstance(counts, (str, bytes)))
             mask, status = _rle_to_mask_safe(seg, height, width, original_size=original_size)
             if mask is not None:
                 masks.append(mask)
@@ -233,7 +432,13 @@ class RefCOCOMapper:
         elif isinstance(seg, (list, tuple)):
             if not seg:
                 statuses.append("seg_missing")
+                raise ValueError("Empty segmentation list encountered")
             elif all(isinstance(poly, (list, tuple)) for poly in seg):
+                for poly in seg:
+                    if poly and len(poly) % 2 != 0:
+                        _mark_gate("polygon_even_len", False)
+                        raise AssertionError("polygon_even_len")
+                _mark_gate("polygon_even_len", True)
                 mask, status = _poly_to_mask_safe(seg, height, width, original_size=original_size)
                 if mask is not None:
                     masks.append(mask)
@@ -245,18 +450,28 @@ class RefCOCOMapper:
                             piece, height, width, original_size=original_size
                         )
                     elif isinstance(piece, (list, tuple)):
+                        if piece and len(piece) % 2 != 0:
+                            _mark_gate("polygon_even_len", False)
+                            raise AssertionError("polygon_even_len")
                         piece_mask, piece_status = _poly_to_mask_safe(
                             [piece], height, width, original_size=original_size
                         )
                     else:
-                        piece_mask, piece_status = (None, "seg_unsupported")
+                        raise ValueError("segmentation format unsupported")
                     if piece_mask is not None:
                         masks.append(piece_mask)
                     statuses.append(piece_status)
         else:
-            statuses.append("seg_missing")
+            raise ValueError("Unsupported segmentation type")
 
-        return merge_instance_masks(masks, height, width, statuses=statuses)
+        merged_mask, status = merge_instance_masks(masks, height, width, statuses=statuses)
+        if dataset_dict is not None and merged_mask is not None:
+            dataset_dict.setdefault("_mask_assertions", {})["decode_outputs_area_gt0"] = (
+                int(merged_mask.sum()) > 0
+            )
+        if merged_mask is None or merged_mask.sum() == 0:
+            raise ValueError("Decoded mask is empty")
+        return merged_mask, status
 
     @staticmethod
     def _collect_ann_ids(dataset_dict, raw_annotations):
@@ -282,6 +497,8 @@ class RefCOCOMapper:
             try:
                 cid = int(cand)
             except (TypeError, ValueError):
+                continue
+            if cid < 0:
                 continue
             if cid not in seen:
                 seen.add(cid)
@@ -377,23 +594,33 @@ class RefCOCOMapper:
         return None
 
     def _synthesize_mask(self, dataset_dict):
-        fallback_shape = None
-        image = dataset_dict.get("image")
-        if torch.is_tensor(image):
-            fallback_shape = (int(image.shape[-2]), int(image.shape[-1]))
-        elif isinstance(image, np.ndarray):
-            fallback_shape = image.shape[:2]
 
-        height, width = self._normalize_hw(
-            dataset_dict.get("height"),
-            dataset_dict.get("width"),
-            fallback_shape,
-        )
+        assertions = dataset_dict.setdefault("_mask_assertions", {})
+        assertions.setdefault("coords_contract_ok", True)
+        assertions.setdefault("bbox_fallback_uses_true_hw", True)
 
         raw_annotations = dataset_dict.get("_raw_annotations") or []
-        transformed_annotations = dataset_dict.get("annotations", []) or []
+        ann_ids_seed = self._collect_ann_ids(dataset_dict, raw_annotations)
 
-        ann_ids = self._collect_ann_ids(dataset_dict, raw_annotations)
+        ann_store_lookup = self.id_to_ann or {}
+
+        image = dataset_dict.get("image")
+        tensor_hw: Optional[Tuple[int, int]] = None
+        if torch.is_tensor(image):
+            tensor_hw = (int(image.shape[-2]), int(image.shape[-1]))
+        elif isinstance(image, np.ndarray):
+            tensor_hw = (int(image.shape[0]), int(image.shape[1]))
+
+        stored_hw: Optional[Tuple[int, int]] = None
+        try:
+            stored_h = dataset_dict.get("height")
+            stored_w = dataset_dict.get("width")
+            if stored_h is not None and stored_w is not None:
+                stored_hw = (int(stored_h), int(stored_w))
+        except (TypeError, ValueError):
+            stored_hw = None
+
+        original_hw = dataset_dict.get("_original_hw")
 
         inst_json = self._resolve_inst_json(dataset_dict)
         if not inst_json and not self._warned_missing_inst_json:
@@ -406,170 +633,259 @@ class RefCOCOMapper:
         ann_store = inst_data["annotations"] if inst_data else {}
         image_hw_store = inst_data["image_hw"] if inst_data else {}
 
-        status_log = []
-        per_instance_masks = []
-        per_instance_statuses = []
+        poly_hw: Optional[Tuple[int, int]] = None
+        if ann_ids_seed:
+            for ann_id in ann_ids_seed:
+                try:
+                    ann_key = int(ann_id)
+                except (TypeError, ValueError):
+                    continue
+                ann_record = ann_store_lookup.get(ann_key) or ann_store.get(ann_key)
+                if not ann_record:
+                    continue
+                dims = self._infer_canvas_hw_from_annotation(ann_record)
+                if dims is None:
+                    continue
+                if poly_hw is None:
+                    poly_hw = dims
+                else:
+                    poly_hw = (max(poly_hw[0], dims[0]), max(poly_hw[1], dims[1]))
+
+        if poly_hw is None and raw_annotations:
+            for ann in raw_annotations:
+                dims = self._infer_canvas_hw_from_annotation(ann)
+                if dims is None:
+                    continue
+                if poly_hw is None:
+                    poly_hw = dims
+                else:
+                    poly_hw = (max(poly_hw[0], dims[0]), max(poly_hw[1], dims[1]))
+
+        image_meta_hw: Optional[Tuple[int, int]] = None
+        image_id = dataset_dict.get("image_id")
+        if image_id is not None:
+            try:
+                image_meta_hw = image_hw_store.get(int(image_id))
+            except (TypeError, ValueError):
+                image_meta_hw = None
+
+        if dataset_dict.get("image") is None and image_meta_hw is not None:
+            dataset_dict["height"], dataset_dict["width"] = image_meta_hw
+            stored_hw = image_meta_hw
+            assertions["offline_mode_has_hw"] = True
+        elif dataset_dict.get("image") is None:
+            assertions["offline_mode_has_hw"] = False
+
+        height, width = self._normalize_hw(
+            [
+                ("image_tensor", tensor_hw),
+                ("dataset_fields", stored_hw),
+                ("original_hw", original_hw),
+                ("instances_json", image_meta_hw),
+                ("poly_bounds", poly_hw),
+            ],
+            dataset_dict=dataset_dict,
+        )
+
+        transformed_annotations = dataset_dict.get("annotations", []) or []
+
+        ann_ids_raw = list(ann_ids_seed)
+        valid_ann_ids: List[int] = []
+        for ann in ann_ids_raw:
+            try:
+                ann_int = int(ann)
+            except (TypeError, ValueError):
+                continue
+            if ann_int < 0:
+                continue
+            valid_ann_ids.append(ann_int)
+
+        merged_mask = np.zeros((height, width), dtype=np.uint8)
+        status_log: List[Dict[str, object]] = []
         missing_ann_ids: List[int] = []
-        fallback_used = False
+        had_bbox_fallback = False
+        had_poly_empty = False
+        had_exception = False
+        contributing = 0
 
-        def _accumulate_status(ann_identifier, status, mask_np):
-            status_log.append(
-                {
-                    "ann_id": ann_identifier,
-                    "status": status,
-                    "mask_sum": int(mask_np.sum()) if mask_np is not None else 0,
-                }
-            )
+        for ann_id in valid_ann_ids:
+            ann_key = int(ann_id)
+            ann_record = ann_store_lookup.get(ann_key) or ann_store.get(ann_key)
+            current_status: List[str] = []
+            mask_np: Optional[np.ndarray] = None
+            decode_error: Optional[str] = None
 
-        if ann_ids:
-            for ann_id in ann_ids:
-                ann_key = int(ann_id)
-                ann_record = self.id_to_ann.get(ann_key) if self.id_to_ann else None
-                if ann_record is None and ann_store:
-                    ann_record = ann_store.get(ann_key)
-                statuses = []
-                mask_np = None
-                mask_sum = 0
+            original_candidate = dataset_dict.get("_original_hw")
+            if ann_record is not None:
+                ann_image_id = ann_record.get("image_id")
+                if ann_image_id is not None:
+                    try:
+                        mapped = image_hw_store.get(int(ann_image_id))
+                    except (TypeError, ValueError):
+                        mapped = None
+                    if mapped:
+                        original_candidate = mapped
 
-                original_hw = None
-                if ann_record is not None:
-                    image_id = ann_record.get("image_id")
-                    if image_id is not None:
-                        try:
-                            original_hw = image_hw_store.get(int(image_id))
-                        except (TypeError, ValueError):
-                            original_hw = None
-
-                    decoded_mask, decode_status = self._decode_annotation_mask(
-                        ann_record, height, width, original_hw=original_hw
+            if ann_record is not None:
+                try:
+                    mask_np, decode_status = self._decode_annotation_mask(
+                        ann_record,
+                        height,
+                        width,
+                        original_hw=original_candidate,
+                        dataset_dict=dataset_dict,
                     )
-                    if decode_status:
-                        statuses.append(decode_status)
-                    if decoded_mask is not None and decoded_mask.sum() > 0:
-                        mask_np = decoded_mask
-                        mask_sum = int(decoded_mask.sum())
+                    current_status.append(decode_status)
+                except ValueError as exc:
+                    decode_error = str(exc)
+                    had_exception = True
 
-                if mask_np is None and ann_record is not None:
-                    bbox_mode = ann_record.get("bbox_mode", "XYWH_ABS")
+            if mask_np is None:
+                if ann_record is None:
+                    missing_ann_ids.append(ann_key)
+                if ann_record is not None and ann_record.get("bbox") is not None:
                     bbox_mask, bbox_status = bbox_to_mask(
                         ann_record.get("bbox"),
                         height,
                         width,
-                        bbox_mode=bbox_mode,
+                        bbox_mode=ann_record.get("bbox_mode", BoxMode.XYWH_ABS),
                     )
-                    if bbox_status:
-                        statuses.append(bbox_status)
                     if bbox_mask is not None and bbox_mask.sum() > 0:
+                        if bbox_mask.shape != (height, width):
+                            raise AssertionError("bbox_fallback_uses_true_hw")
                         mask_np = bbox_mask
-                        mask_sum = int(bbox_mask.sum())
-                        fallback_used = True
+                        current_status.append(bbox_status)
+                        had_bbox_fallback = True
+                        assertions["bbox_fallback_uses_true_hw"] = True
+                elif decode_error is not None:
+                    logger.error(
+                        "[RefCOCOMapper] Mask decode failed for ann_id=%s: %s",
+                        ann_key,
+                        decode_error,
+                    )
+                    raise
 
-                if ann_record is None:
-                    missing_ann_ids.append(ann_key)
+            
 
-                if mask_np is None:
-                    raw_ann = self._find_raw_annotation(raw_annotations, ann_id)
-                    if raw_ann is not None:
-                        decoded_mask, decode_status = self._decode_annotation_mask(
-                            raw_ann,
-                            height,
-                            width,
-                            original_hw=fallback_shape,
+            if mask_np is None and transformed_annotations:
+                for ann in transformed_annotations:
+                    bbox_mask, bbox_status = bbox_to_mask(
+                        ann.get("bbox"),
+                        height,
+                        width,
+                        bbox_mode=ann.get("bbox_mode", BoxMode.XYXY_ABS),
+                    )
+                    if bbox_mask is not None and bbox_mask.sum() > 0:
+                        if bbox_mask.shape != (height, width):
+                            raise AssertionError("bbox_fallback_uses_true_hw")
+                        mask_np = bbox_mask
+                        current_status.append(bbox_status)
+                        had_bbox_fallback = True
+                        assertions["bbox_fallback_uses_true_hw"] = True
+                        break
+
+            if mask_np is None:
+                logger.error(
+                    "[RefCOCOMapper] Unable to obtain mask for ann_id=%s after strict policy",
+                    ann_key,
+                )
+                raise AssertionError("Strict rejection policy triggered")
+
+            mask_np = np.ascontiguousarray(mask_np.astype(np.uint8, copy=False))
+            if mask_np.shape != (height, width):
+                raise AssertionError(
+                    f"Decoded mask shape {mask_np.shape} does not match expected {(height, width)}"
+                )
+
+            mask_area = int(mask_np.sum())
+            if mask_area == 0:
+                had_poly_empty = had_poly_empty or any("poly" in s for s in current_status)
+                logger.error(
+                    "[RefCOCOMapper] Zero-area mask for ann_id=%s violates area contract",
+                    ann_key,
+                )
+                raise AssertionError("decode_outputs_area_gt0")
+
+            merged_mask = np.maximum(merged_mask, mask_np)
+            contributing += 1
+
+            if ann_record is not None and ann_record.get("bbox") is not None:
+                try:
+                    bbox_mode = ann_record.get("bbox_mode", BoxMode.XYWH_ABS)
+                    xyxy = BoxMode.convert(ann_record.get("bbox"), bbox_mode, BoxMode.XYXY_ABS)
+
+                    ys, xs = np.nonzero(mask_np)
+                    mask_x0 = int(xs.min()) if xs.size else 0
+                    mask_y0 = int(ys.min()) if ys.size else 0
+                    mask_x1 = int(xs.max() + 1) if xs.size else 0
+                    mask_y1 = int(ys.max() + 1) if ys.size else 0
+
+                    ref_hw = original_candidate or dataset_dict.get("_original_hw")
+                    if ref_hw is None:
+                        ref_hw = (height, width)
+
+                    try:
+                        oh = max(int(ref_hw[0]), 1)
+                        ow = max(int(ref_hw[1]), 1)
+                    except (TypeError, ValueError):
+                        oh, ow = height, width
+
+                    if oh <= 0 or ow <= 0:
+                        oh, ow = height, width
+
+                    sx = float(width) / float(ow)
+                    sy = float(height) / float(oh)
+
+                    bx0 = xyxy[0] * sx
+                    by0 = xyxy[1] * sy
+                    bx1 = xyxy[2] * sx
+                    by1 = xyxy[3] * sy
+
+                    tol = max(1.5, 0.005 * float(max(height, width)))
+
+                    coords_ok = (
+                        mask_x0 >= math.floor(bx0 - tol)
+                        and mask_y0 >= math.floor(by0 - tol)
+                        and mask_x1 <= math.ceil(bx1 + tol)
+                        and mask_y1 <= math.ceil(by1 + tol)
+                    )
+
+                    is_bbox_used = any(("bbox" in (s or "").lower()) for s in current_status)
+
+                    assertions["coords_contract_ok"] = bool(coords_ok)
+                    if not coords_ok:
+                        msg = (
+                            f"[RefCOCOMapper] coords_contract mismatch (scaled bbox "
+                            f"({bx0:.1f},{by0:.1f},{bx1:.1f},{by1:.1f}) vs "
+                            f"mask_box ({mask_x0},{mask_y0},{mask_x1},{mask_y1})) "
+                            f"@canvas ({height},{width}), tol={tol:.2f}, ann_id={ann_key}"
                         )
-                        if decode_status:
-                            statuses.append(decode_status)
-                        if decoded_mask is not None and decoded_mask.sum() > 0:
-                            mask_np = decoded_mask
-                            mask_sum = int(decoded_mask.sum())
+                        if is_bbox_used:
+                            logger.error(msg)
+                            raise AssertionError("coords_contract_ok")
+                        logger.warning(msg)
+                except Exception as exc:
+                    logger.error(
+                        "[RefCOCOMapper] Coordinate contract failure for ann_id=%s: %s",
+                        ann_key,
+                        exc,
+                    )
+                    raise
 
-                if mask_np is None and transformed_annotations:
-                    for ann in transformed_annotations:
-                        bbox_mask, bbox_status = bbox_to_mask(
-                            ann.get("bbox"),
-                            height,
-                            width,
-                            bbox_mode=ann.get("bbox_mode", BoxMode.XYXY_ABS),
-                        )
-                        if bbox_status:
-                            statuses.append(bbox_status)
-                        if bbox_mask is not None and bbox_mask.sum() > 0:
-                            mask_np = bbox_mask
-                            mask_sum = int(bbox_mask.sum())
-                            fallback_used = True
-                            break
+            status_log.append(
+                {
+                    "ann_id": ann_key,
+                    "status": "+".join(current_status) if current_status else "unknown",
+                    "mask_sum": mask_area,
+                    "error": decode_error,
+                }
+            )
+        if contributing == 0 and not bool(dataset_dict.get("no_target", False)):
+            raise AssertionError("merge_outputs_area_gt0")
 
-                if mask_np is None:
-                    synthetic_mask = np.zeros((height, width), dtype=np.uint8)
-                    synthetic_mask[height // 2, width // 2] = 1
-                    mask_np = synthetic_mask
-                    mask_sum = 1
-                    statuses.append("synthetic")
-                    fallback_used = True
-
-                status_label = "+".join([s for s in statuses if s]) or "missing"
-                mask_np = np.ascontiguousarray((mask_np > 0).astype(np.uint8, copy=False))
-                per_instance_masks.append(mask_np)
-                per_instance_statuses.append(status_label)
-                _accumulate_status(int(ann_id), status_label, mask_np)
-
-        if not per_instance_masks and raw_annotations:
-            for idx, raw_ann in enumerate(raw_annotations):
-                decoded_mask, decode_status = self._decode_annotation_mask(
-                    raw_ann,
-                    height,
-                    width,
-                    original_hw=fallback_shape,
-                )
-                if decoded_mask is None or decoded_mask.sum() == 0:
-                    continue
-                mask_np = np.ascontiguousarray((decoded_mask > 0).astype(np.uint8, copy=False))
-                per_instance_masks.append(mask_np)
-                status = decode_status or "raw"
-                per_instance_statuses.append(status)
-                _accumulate_status(f"raw_{idx}", status, mask_np)
-
-        final_mask, merged_status = merge_instance_masks(
-            per_instance_masks,
-            height,
-            width,
-            statuses=per_instance_statuses if per_instance_statuses else None,
-        )
-
-        if (final_mask is None or final_mask.sum() == 0) and transformed_annotations:
-            bbox_masks = []
-            bbox_statuses = []
-            for ann in transformed_annotations:
-                bbox_mask, bbox_status = bbox_to_mask(
-                    ann.get("bbox"),
-                    height,
-                    width,
-                    bbox_mode=ann.get("bbox_mode", BoxMode.XYXY_ABS),
-                )
-                if bbox_mask is not None and bbox_mask.sum() > 0:
-                    bbox_masks.append(bbox_mask)
-                bbox_statuses.append(bbox_status)
-
-            if bbox_masks:
-                final_mask, fallback_status = merge_instance_masks(
-                    bbox_masks,
-                    height,
-                    width,
-                    statuses=bbox_statuses,
-                )
-                fallback_used = True
-                if final_mask is not None:
-                    final_mask = np.ascontiguousarray((final_mask > 0).astype(np.uint8, copy=False))
-                    _accumulate_status("bbox_fallback", fallback_status, final_mask)
-
-        if final_mask is None or final_mask.sum() == 0:
-            synthetic_mask = np.zeros((height, width), dtype=np.uint8)
-            synthetic_mask[height // 2, width // 2] = 1
-            final_mask = synthetic_mask
-            fallback_used = True
-            _accumulate_status("synthetic_fallback", "synthetic", final_mask)
-
-        final_mask = np.ascontiguousarray((final_mask > 0).astype(np.uint8, copy=False))
-        dataset_dict["height"], dataset_dict["width"] = height, width
+        total_area = int(merged_mask.sum())
+        assertions["merge_outputs_area_gt0"] = total_area > 0 or bool(dataset_dict.get("no_target", False))
+        assertions["decode_outputs_area_gt0"] = total_area > 0 or bool(dataset_dict.get("no_target", False))
 
         decode_counts = {"rle": 0, "poly": 0, "bbox": 0, "synthetic": 0}
         for entry in status_log:
@@ -597,19 +913,38 @@ class RefCOCOMapper:
         else:
             mode_label = "UNKNOWN"
 
+        nonzero_ratio = mask_area / float(height * width) if height and width else 0.0
+        merge_ratio = contributing / float(max(len(valid_ann_ids), 1)) if valid_ann_ids else 0.0
+        assertions["merge_outputs_ratio"] = merge_ratio
+
         dataset_dict["mask_status"] = {
             "height": height,
             "width": width,
+            "original_hw": dataset_dict.get("_original_hw"),
             "groups": status_log,
             "decode_counts": decode_counts,
-            "fallback_used": fallback_used,
-            "num_groups": len(per_instance_masks),
-            "mask_sum": int(final_mask.sum()),
+            "fallback_used": had_bbox_fallback,
+            "num_groups": len(status_log),
+            "mask_sum": total_area,
             "inst_json": inst_json,
             "mode": mode_label,
             "missing_ann_ids": missing_ann_ids,
             "used_synthetic": decode_counts["synthetic"] > 0,
+            "contributing": contributing,
+            "merge_ratio": merge_ratio,
+            "nonzero_ratio": nonzero_ratio,
         }
+
+        mode_used = mode_label
+        mask_area = total_area
+        mode_source = "OFFLINE" if dataset_dict.get("image") is None else "ONLINE"
+        ann_ids_csv = ";".join(str(a) for a in valid_ann_ids) if valid_ann_ids else ""
+        csv_line = (
+            f"{dataset_dict.get('image_id','unknown')},{ann_ids_csv},{mode_used},{mode_source},{height},{width},"
+            f"{mask_area},{contributing},{int(had_bbox_fallback)},{int(had_poly_empty)},{int(had_exception)}"
+        )
+        logger.info("[RefCOCOMapper][audit]%s", csv_line)
+        dataset_dict["mask_audit_csv"] = csv_line
 
         image_id = dataset_dict.get("image_id", "unknown")
         ann_summary = dataset_dict.get("ann_ids") or dataset_dict.get("ann_id") or []
@@ -628,15 +963,31 @@ class RefCOCOMapper:
             image_id,
             normalized_ann_summary,
             mode_label,
-            tuple(final_mask.shape),
-            int(final_mask.sum()),
-            fallback_used,
+            tuple(merged_mask.shape),
+            mask_area,
+            had_bbox_fallback,
             source_desc,
         )
-        return final_mask
+        logger.debug(
+            "[RefCOCOMapper] final mode=%s | mask.shape=%s | mask.sum=%d",
+            mode_label,
+            tuple(merged_mask.shape),
+            mask_area,
+        )
+        return merged_mask
 
     def __call__(self, dataset_dict):
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
+        dataset_dict["_mask_assertions"] = {}
+        original_hw = None
+        try:
+            orig_h = int(dataset_dict.get("height"))
+            orig_w = int(dataset_dict.get("width"))
+            if orig_h > 0 and orig_w > 0:
+                original_hw = (orig_h, orig_w)
+        except (TypeError, ValueError):
+            original_hw = None
+        dataset_dict["_original_hw"] = original_hw
         raw_annos_input = dataset_dict.get("annotations", []) or []
         dataset_dict["_raw_annotations"] = copy.deepcopy(raw_annos_input)
         if "ann_ids" not in dataset_dict and "ann_id" in dataset_dict:
@@ -669,6 +1020,9 @@ class RefCOCOMapper:
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
         dataset_dict["padding_mask"] = torch.as_tensor(np.ascontiguousarray(padding_mask))
         dataset_dict["height"], dataset_dict["width"] = image_shape
+        dataset_dict.setdefault("_mask_assertions", {})["post_aug_shape_contract"] = (
+            dataset_dict["image"].shape[-2:] == tuple(image_shape)
+        )
 
         # USER: Implement additional transformations if you have other types of data
         annos = []
@@ -789,6 +1143,7 @@ class RefCOCOMapper:
             sent = str(sent) if sent is not None else ""
         dataset_dict["sentence"] = sent
 
+        dataset_dict.pop("_original_hw", None)
         return dataset_dict
     @staticmethod
     def _resize_mask(mask, height, width):
@@ -803,3 +1158,66 @@ class RefCOCOMapper:
         resized = F.interpolate(tensor, size=(height, width), mode="nearest")
         return resized.squeeze(0).squeeze(0).to(dtype=torch.uint8).cpu().numpy()
 
+
+def _run_internal_tests():
+    """Lightweight self-checks to ensure mapper helpers behave as expected."""
+
+    mapper = RefCOCOMapper(is_train=False, tfm_gens=[], preload_only=True)
+
+    # Sample 1: Conflicting height/width sources resolved to the largest canvas.
+    dataset_a = {
+        "image": torch.zeros((3, 48, 48), dtype=torch.float32),
+        "height": 48,
+        "width": 48,
+        "ann_ids": [1],
+        "annotations": [],
+        "_raw_annotations": [],
+        "_original_hw": (96, 48),
+        "image_id": 101,
+        "no_target": False,
+        "_mask_assertions": {},
+    }
+    mapper.id_to_ann = {
+        1: {
+            "id": 1,
+            "bbox": [20, 20, 16, 16],
+            "bbox_mode": BoxMode.XYWH_ABS,
+            "segmentation": [[20, 20, 36, 20, 36, 36, 20, 36]],
+        }
+    }
+    mask_a = mapper._synthesize_mask(dataset_a)
+    print(
+        f"[RefCOCOMapper][test] sample-A | hw={mask_a.shape} | "
+        f"coords_contract_ok={dataset_a.get('_mask_assertions', {}).get('coords_contract_ok')}"
+    )
+
+    # Sample 2: Empty segmentation triggers bbox fallback while respecting contracts.
+    dataset_b = {
+        "image": torch.zeros((3, 64, 64), dtype=torch.float32),
+        "height": 64,
+        "width": 64,
+        "ann_ids": [2],
+        "annotations": [],
+        "_raw_annotations": [],
+        "_original_hw": (64, 64),
+        "image_id": 202,
+        "no_target": False,
+        "_mask_assertions": {},
+    }
+    mapper.id_to_ann = {
+        2: {
+            "id": 2,
+            "bbox": [16, 16, 20, 20],
+            "bbox_mode": BoxMode.XYWH_ABS,
+            "segmentation": [],
+        }
+    }
+    mask_b = mapper._synthesize_mask(dataset_b)
+    print(
+        f"[RefCOCOMapper][test] sample-B | hw={mask_b.shape} | "
+        f"coords_contract_ok={dataset_b.get('_mask_assertions', {}).get('coords_contract_ok')}"
+    )
+
+
+if __name__ == "__main__":
+    _run_internal_tests()
